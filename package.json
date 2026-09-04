@@ -1,0 +1,14 @@
+{
+  "name": "omniroute-cloudflare-proxy-v3",
+  "private": true,
+  "version": "3.0.0",
+  "scripts": {
+    "deploy:providers": "npm run deploy:bai && npm run deploy:dahl",
+    "deploy:bai": "wrangler deploy -c providers/bai/wrangler.toml",
+    "deploy:dahl": "wrangler deploy -c providers/dahl/wrangler.toml",
+    "deploy:router": "wrangler deploy -c router/wrangler.toml"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}

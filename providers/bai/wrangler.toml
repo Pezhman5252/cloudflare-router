@@ -1,0 +1,16 @@
+name = "omniroute-provider-bai"
+main = "src/index.js"
+compatibility_date = "2026-09-04"
+workers_dev = false
+
+[placement]
+mode = "smart"
+
+[vars]
+UPSTREAM_BASE_URL = "https://api.b.ai/v1"
+AUTH_MODE = "bearer"
+ENVIRONMENT = "production"   # یا "development" برای دیباگ
+
+# Required secret for upstream Provider authentication (comma-separated list of keys)
+[secrets]
+required = ["UPSTREAM_API_KEYS"]
