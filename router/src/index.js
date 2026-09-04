@@ -36,9 +36,6 @@ export default {
       return json({ error: "unknown_provider" }, 404);
     }
 
-    // The value used here is NOT the upstream Provider API key.
-    // Set a dedicated gateway key for the Router Worker and configure the
-    // same value as the API key/header credential used by OmniRoute.
     const gatewayKey = env.ROUTER_API_KEY;
     if (!gatewayKey) {
       return json({ error: "router_not_configured" }, 500);
@@ -64,7 +61,6 @@ export default {
     const requestId = request.headers.get("x-request-id") || crypto.randomUUID();
     const downstreamPath = stripPrefix(incoming.pathname, route.prefix) + incoming.search;
 
-    // Read once so retries can recreate the POST body safely.
     const bodyBuffer = request.body ? await request.arrayBuffer() : undefined;
     if (bodyBuffer && bodyBuffer.byteLength > MAX_BODY_BYTES) {
       return json({ error: "request_body_too_large" }, 413);
@@ -129,8 +125,6 @@ export default {
 };
 
 function extractGatewayKey(request) {
-  // OmniRoute normally sends Authorization when an API key is configured.
-  // A dedicated X-Router-API-Key header is also supported.
   const custom = request.headers.get("x-router-api-key");
   if (custom) return custom.trim();
 
@@ -177,7 +171,6 @@ function decorate(response, requestId, provider, latencyMs, retryCount) {
   headers.set("x-retry-count", String(retryCount));
   headers.set("cache-control", "no-store");
 
-  // افزودن هدرهای CORS
   const cors = corsHeaders();
   for (const [key, value] of Object.entries(cors)) {
     headers.set(key, value);

@@ -9,8 +9,11 @@ mode = "smart"
 [vars]
 UPSTREAM_BASE_URL = "https://inference.dahl.global/v1"
 AUTH_MODE = "bearer"
-ENVIRONMENT = "production"   # یا "development" برای دیباگ
+ENVIRONMENT = "production"
 
-# Required secret for upstream Provider authentication (comma-separated list of keys)
+[[kv_namespaces]]
+binding = "KV_USAGE"
+id = "b0c242db76504b4b910549a75fa551b6"   # 👈 پس از ایجاد KV، این id را جایگزین کنید
+
 [secrets]
 required = ["UPSTREAM_API_KEYS"]

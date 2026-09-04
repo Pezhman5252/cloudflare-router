@@ -3,6 +3,11 @@ main = "src/index.js"
 compatibility_date = "2026-09-04"
 workers_dev = true
 
+# غیرفعال کردن Preview URLs برای محیط Production
+# با فعال بودن (true) برای هر بار deploy یک آدرس جدید ایجاد می‌شود
+# که برای تست مفید است، اما برای Production بهتر است false باشد.
+preview_urls = false
+
 [placement]
 mode = "smart"
 
