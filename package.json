@@ -1,15 +1,25 @@
 {
-  "name": "omniroute-cloudflare-proxy-v3",
-  "private": true,
-  "version": "3.0.0",
-  "type": "module",
-  "scripts": {
-    "deploy:providers": "npm run deploy:bai && npm run deploy:dahl",
-    "deploy:bai": "wrangler deploy -c providers/bai/wrangler.toml",
-    "deploy:dahl": "wrangler deploy -c providers/dahl/wrangler.toml",
-    "deploy:router": "wrangler deploy -c router/wrangler.toml"
+  "name":"cloudflare-router",
+  "version":"4.0.1",
+  "private":true,
+  "type":"module",
+  "scripts":{
+    "test":"node tests/v4-verify.mjs",
+    "deploy":"npm run deploy:providers && npm run deploy:router",
+    "deploy:providers":"npm run deploy:bai && npm run deploy:dahl",
+    "deploy:bai":"wrangler deploy -c providers/bai/wrangler.toml",
+    "deploy:dahl":"wrangler deploy -c providers/dahl/wrangler.toml",
+    "deploy:router":"wrangler deploy -c router/wrangler.toml",
+    "dev:bai":"wrangler dev -c providers/bai/wrangler.toml",
+    "dev:dahl":"wrangler dev -c providers/dahl/wrangler.toml",
+    "dev:router":"wrangler dev -c router/wrangler.toml",
+    "check":"wrangler deploy --dry-run -c providers/bai/wrangler.toml && wrangler deploy --dry-run -c providers/dahl/wrangler.toml && wrangler deploy --dry-run -c router/wrangler.toml"
   },
-  "devDependencies": {
-    "wrangler": "latest"
+  "devDependencies":{"wrangler":"latest"},
+  "allowScripts":{
+    "wrangler":true,
+    "esbuild":true,
+    "miniflare":true,
+    "workerd":true
   }
 }

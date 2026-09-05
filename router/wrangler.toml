@@ -1,23 +1,24 @@
-name = "omniroute-master-proxy"
-main = "src/index.js"
-compatibility_date = "2026-09-04"
-workers_dev = true
-
-# غیرفعال کردن Preview URLs برای محیط Production
-# با فعال بودن (true) برای هر بار deploy یک آدرس جدید ایجاد می‌شود
-# که برای تست مفید است، اما برای Production بهتر است false باشد.
-preview_urls = false
+name="omniroute-master-proxy"
+main="src/index.js"
+compatibility_date="2026-09-05"
+# آدرس عمومی workers.dev برای راوتر فعال باشد (کلید گیت‌وی آن را محافظت می‌کند)
+workers_dev=true
+preview_urls=false
 
 [placement]
-mode = "smart"
+mode="smart"
 
 [[services]]
-binding = "BAI_WORKER"
-service = "omniroute-provider-bai"
+binding="BAI_WORKER"
+service="omniroute-provider-bai"
 
 [[services]]
-binding = "DAHL_WORKER"
-service = "omniroute-provider-dahl"
+binding="DAHL_WORKER"
+service="omniroute-provider-dahl"
+
+[vars]
+ENVIRONMENT="production"
+MAX_BODY_BYTES="26214400"
 
 [secrets]
-required = ["ROUTER_API_KEY"]
+required=["ROUTER_API_KEY"]

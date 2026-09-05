@@ -1,22 +1,33 @@
-name = "omniroute-provider-bai"
-main = "src/index.js"
-compatibility_date = "2026-09-04"
-workers_dev = false
-# آدرس‌های preview هم غیرفعال بماند — این Worker فقط از طریق سرویس‌بایندینگِ
-# Router قابل دسترس باشد و هیچ ورودی عمومی (حتی آزمایشی) نداشته باشد.
-preview_urls = false
+name="omniroute-provider-bai"
+main="src/index.js"
+compatibility_date="2026-09-05"
+workers_dev=false
+preview_urls=false
 
 [placement]
-mode = "smart"
+mode="smart"
 
 [vars]
-UPSTREAM_BASE_URL = "https://api.b.ai/v1"
-AUTH_MODE = "bearer"
-ENVIRONMENT = "production"
+UPSTREAM_BASE_URL="https://api.b.ai/v1"
+# نحوه‌ی ارسال کلید به upstream: "bearer" یا "x-api-key"
+AUTH_MODE="bearer"
+ENVIRONMENT="production"
+MAX_BODY_BYTES="26214400"
+UPSTREAM_TIMEOUT_MS="180000"
+MAX_ATTEMPTS="4"
+BACKOFF_MS="350"
+MAX_BACKOFF_MS="60000"
+RATE_COOLDOWN_MS="30000"
+AUTH_COOLDOWN_MS="900000"
+TRANSIENT_COOLDOWN_MS="5000"
 
-[[kv_namespaces]]
-binding = "KV_USAGE"
-id = "your-kv-namespace-id"   # 👈 پس از ایجاد KV، این id را جایگزین کنید
+[[durable_objects.bindings]]
+name="KEY_COORDINATOR"
+class_name="ApiKeyCoordinator"
+
+[[migrations]]
+tag="v1"
+new_sqlite_classes=["ApiKeyCoordinator"]
 
 [secrets]
-required = ["UPSTREAM_API_KEYS"]
+required=["UPSTREAM_API_KEYS"]

@@ -3,3 +3,10 @@ node_modules/
 .dev.vars
 .env
 *.log
+
+# آثار موقت ابزارها و تست‌ها — هرگز commit نشوند
+.npm-cache/
+.tmp-sql-probe/
+tests/.tmp-v4-core.mjs
+body.json
+body-stream.json
