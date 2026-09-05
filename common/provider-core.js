@@ -211,6 +211,9 @@ export class ApiKeyCoordinator extends DurableObject {
     const isSuccess = status >= 200 && status < 300;
     const isRedirect = status >= 300 && status < 400;
     const isClientError = status >= 400 && status < 500;
+    // 3xx (مثلاً 304 با هدرهای شرطی، یا انتهای زنجیره‌ی redirect) پاسخ قابل‌قبول است؛
+    // شاخه‌ی redirect کلید را healthy اعلام می‌کند، پس حسابداری هم باید همین را بگوید.
+    const isOk = isSuccess || isRedirect;
 
     if (status === 401) {
       // کلید مشکوک به تعویض: قرنطینه‌ی موقت (نه مسدودی دائمی)
@@ -244,8 +247,10 @@ export class ApiKeyCoordinator extends DurableObject {
       incFailures = 1;
     }
 
-    const shouldIncrementFailure = !isSuccess && status !== 0 && !isRedirect && !isClientError;
-    const failures = shouldIncrementFailure ? Number(row[1]) + incFailures : Number(row[1]);
+    // incFailures در هر شاخه‌ی بالا دقیقاً تعیین شده و منبع یگانه‌ی حقیقت است؛
+    // بازمحاسبه‌ی آن با شرط عمومی (مثل isClientError یا status=0) باگ بود:
+    // 401/403/429 جزو 4xx و خطای شبکه status=0 است و شمارش failures را دور می‌زد.
+    const failures = Number(row[1]) + incFailures;
     const ema = Number(row[0]) * 0.8 + latency * 0.2;
 
     // UPDATE تک‌statement است و چون تا پایانش هیچ await نیست، در DO اتمیک است؛
@@ -270,16 +275,16 @@ export class ApiKeyCoordinator extends DurableObject {
         total,
         input,
         output,
-        isSuccess ? 1 : 0,
-        isSuccess ? 0 : 1,
+        isOk ? 1 : 0,
+        isOk ? 0 : 1,
         status === 429 ? 1 : 0,
         failures,
         ema,
         state,
         cooldown,
-        isSuccess ? 1 : 0,
+        isOk ? 1 : 0,
         now,
-        !isSuccess ? 1 : 0,
+        !isOk ? 1 : 0,
         now,
         kid
     );
@@ -316,8 +321,16 @@ export class ApiKeyCoordinator extends DurableObject {
 async function upstream(req, url, key, reqId, attempt, timeout, bodyBuffer, authMode) {
   const headers = new Headers(req.headers);
   const removeHeaders = [
-    "authorization", "x-api-key", "x-auth-token", "x-router-api-key",
-    "host", "content-length", "cf-connecting-ip", "x-forwarded-for", "x-real-ip"
+    "authorization",
+    "x-api-key",
+    "x-auth-token",
+    "x-router-api-key",
+    "x-omniroute-provider",
+    "host",
+    "content-length",
+    "cf-connecting-ip",
+    "x-forwarded-for",
+    "x-real-ip"
   ];
   for (const h of removeHeaders) headers.delete(h);
 

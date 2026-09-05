@@ -231,7 +231,7 @@ try {
     }
 
     // ─────────────────────────────────────────────────────────
-    console.log("── T3: تک‌کلید + 401 → 503 صریح، سپس بازیابی پس از cooldown ──");
+    console.log("── T3: تک‌کلید + 401 → passthrough 401 به کلاینت، سپس بازیابی پس از cooldown ──");
     {
         const t = makeEnv(["KEY_A"]);
         t.mockFetch([new Response("{}", { status: 401 })]);

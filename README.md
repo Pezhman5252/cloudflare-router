@@ -40,7 +40,7 @@ Router اصلی **عمداً retry نمی‌کند** تا دو لایه‌ی ret
 ## فایل‌ها
 
 ```text
-New/
+cloudflare-router/
 ├── README.md
 ├── package.json
 ├── .gitignore
