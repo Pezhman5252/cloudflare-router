@@ -1,72 +1,19 @@
-OMNIROUTE CLOUDFLARE V3 — FINAL INSTALLATION
+# ۱. لاگین (اگر لازم است)
+wrangler login
 
-1) Install Node.js LTS.
-2) Extract this ZIP, for example:
-   C:\omniroute-cloudflare-v3
-3) Open PowerShell in that folder.
-4) Install dependencies and authenticate:
-   npm install
-   npx wrangler login
+# ۲. ایجاد KV برای bai
+wrangler kv namespace create "USAGE_BAI"
 
-5) Create the Router access key. This is a NEW gateway key; do not use a Provider API key here.
-   npx wrangler secret put ROUTER_API_KEY -c router/wrangler.toml
-   Enter a strong random value when prompted and save it securely.
+# ۳. ایجاد KV برای dahl
+wrangler kv namespace create "USAGE_DAHL"
 
-6) Add BAI's real API key to the BAI Worker:
-   npx wrangler secret put UPSTREAM_API_KEY -c providers/bai/wrangler.toml
+# ۴. IDهای دریافتی را در فایل‌های wrangler.toml قرار دهید.
 
-7) Add DAHL's real API key to the DAHL Worker:
-   npx wrangler secret put UPSTREAM_API_KEY -c providers/dahl/wrangler.toml
+# ۵. تنظیم سکریت‌ها
+wrangler secret put ROUTER_API_KEY -c router/wrangler.toml
+wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
+wrangler secret put UPSTREAM_API_KEYS -c providers/dahl/wrangler.toml
 
-8) Deploy the two Provider Workers FIRST:
-   npm run deploy:providers
-
-9) Deploy the Router Worker SECOND:
-   npm run deploy:router
-
-10) You do NOT manually create these Workers in the Cloudflare Dashboard.
-    The names come from the Wrangler files and are created/updated by deploy:
-      omniroute-provider-bai
-      omniroute-provider-dahl
-      omniroute-master-proxy
-
-11) Get the Router URL from the deploy output, for example:
-    https://omniroute-master-proxy.<subdomain>.workers.dev
-
-12) In OmniRoute configure ONLY the Base URL for each Provider:
-
-    BAI Base URL:
-    https://omniroute-master-proxy.<subdomain>.workers.dev/a
-
-    DAHL Base URL:
-    https://omniroute-master-proxy.<subdomain>.workers.dev/b
-
-13) OmniRoute will append the API path itself. Examples:
-
-    /a/chat/completions
-      -> https://api.b.ai/v1/chat/completions
-
-    /b/chat/completions
-      -> https://inference.dahl.global/v1/chat/completions
-
-14) OmniRoute must authenticate to the Router using the ROUTER_API_KEY value from step 5.
-    If OmniRoute has an API-key field, put ROUTER_API_KEY there.
-    Do NOT put BAI/DAHL's upstream API key in that field.
-
-15) Health check (no authentication required):
-    https://omniroute-master-proxy.<subdomain>.workers.dev/health
-
-16) Provider routing is path-based:
-    /a -> https://api.b.ai/v1
-    /b -> https://inference.dahl.global/v1
-
-17) The Provider Workers are configured with workers_dev = false and are reachable from
-    the Router through Cloudflare Service Bindings, not through public workers.dev URLs.
-
-18) Adding a new provider:
-    - Copy a provider folder.
-    - Change name and UPSTREAM_BASE_URL.
-    - Add its Service Binding to router/wrangler.toml.
-    - Add its /<prefix> route to router/src/index.js.
-    - Add its UPSTREAM_API_KEY secret.
-    - Deploy the provider first, then redeploy the router.
+# ۶. استقرار
+npm run deploy:providers
+npm run deploy:router
