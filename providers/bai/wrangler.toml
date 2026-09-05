@@ -13,7 +13,7 @@ ENVIRONMENT = "production"
 
 [[kv_namespaces]]
 binding = "KV_USAGE"
-id = "66090c4f6fdc476d8a929b9ac1728f26"   # 👈 پس از ایجاد KV، این id را جایگزین کنید
+id = "your-kv-namespace-id"   # 👈 پس از ایجاد KV، این id را جایگزین کنید
 
 [secrets]
 required = ["UPSTREAM_API_KEYS"]
