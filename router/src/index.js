@@ -1,11 +1,19 @@
 /**
- * OmniRoute Cloudflare Router (Improved)
+ * OmniRoute Cloudflare Router
  *
  * Base URLs for OmniRoute:
- *   https://<router-host>/a -> https://api.b.ai/v1
- *   https://<router-host>/b -> https://inference.dahl.global/v1
+ *   https://<router-host>/a -> https://api.b.ai/v1      (service: omniroute-provider-bai)
+ *   https://<router-host>/b -> https://inference.dahl.global/v1 (service: omniroute-provider-dahl)
  *
- * OmniRoute appends endpoint paths itself.
+ * OmniRoute appends endpoint paths itself (e.g. /a/chat/completions).
+ *
+ * طراحی لایه‌ها:
+ *   - این Router فقط احراز هویت کلاینت، مسیریابی و هدرهای تزئینی را انجام می‌دهد.
+ *   - retry، 429/Retry-After، چرخش و مسدودسازی کلید و تایم‌اوت upstream
+ *     به‌طور کامل در Provider Workerها انجام می‌شود تا «تشدید retry»
+ *     (۹ فراخوانی upstream برای یک درخواست) رخ ندهد.
+ *   - فقط خطاهای خودِ binding (قابل‌دستیار نبودن Worker مقصد) تا ۳ تلاش
+ *     با backoff نمایی تکرار می‌شود؛ پاسخ‌های status هیچ‌گاه بازتولید نمی‌شوند.
  */
 
 const ROUTES = [
@@ -14,10 +22,8 @@ const ROUTES = [
 ];
 
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
-const ROUTER_TIMEOUT_MS = 180_000;
-const MAX_RETRIES = 2;
+const BINDING_RETRIES = 2;           // فقط برای خطای فراخوانی binding؛ کل تلاش‌ها: ۳
 const BASE_RETRY_DELAY_MS = 300;
-const RETRYABLE_STATUS = new Set([429, 401, 403, 500, 502, 503, 504]);
 
 export default {
   async fetch(request, env) {
@@ -36,7 +42,8 @@ export default {
       return json({ error: "unknown_provider" }, 404);
     }
 
-    const gatewayKey = env.ROUTER_API_KEY;
+    // trim: اگر سکریت با newline انتهایی ذخیره شده باشد، مقایسه همیشه شکست می‌خورد
+    const gatewayKey = String(env.ROUTER_API_KEY || "").trim();
     if (!gatewayKey) {
       return json({ error: "router_not_configured" }, 500);
     }
@@ -61,16 +68,16 @@ export default {
     const requestId = request.headers.get("x-request-id") || crypto.randomUUID();
     const downstreamPath = stripPrefix(incoming.pathname, route.prefix) + incoming.search;
 
-    const bodyBuffer = request.body ? await request.arrayBuffer() : undefined;
+    // بدنه یک‌بار بافر می‌شود تا در صورت نیاز به retry خطای binding،
+    // استریم مصرف‌شده دوباره قابل استفاده باشد.
+    const bodyBuffer = request.body ? await request.arrayBuffer() : null;
     if (bodyBuffer && bodyBuffer.byteLength > MAX_BODY_BYTES) {
       return json({ error: "request_body_too_large" }, 413);
     }
 
-    let lastResponse = null;
-    let attempt = 0;
+    let lastError = null;
 
-    for (attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      const started = Date.now();
+    for (let attempt = 0; attempt <= BINDING_RETRIES; attempt++) {
       const headers = new Headers(request.headers);
 
       headers.set("x-request-id", requestId);
@@ -86,38 +93,31 @@ export default {
       headers.delete("x-real-ip");
       headers.delete("x-router-api-key");
 
+      // سیگنال از طریق خود Request پاس داده می‌شود تا در صورت پشتیبانی
+      // پیاده‌سازی binding از لغو درخواست، تایم‌اوت معنا داشته باشد.
       const targetRequest = new Request(`https://internal${downstreamPath}`, {
         method: request.method,
         headers,
         body: bodyBuffer ? bodyBuffer.slice(0) : undefined,
+        signal: AbortSignal.timeout(180_000),
       });
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), ROUTER_TIMEOUT_MS);
-
       try {
-        const response = await binding.fetch(targetRequest, { signal: controller.signal });
-        clearTimeout(timer);
-        lastResponse = response;
-
-        if (!RETRYABLE_STATUS.has(response.status) || attempt === MAX_RETRIES) {
-          return decorate(response, requestId, route.provider, Date.now() - started, attempt);
-        }
-
-        await sleep(retryDelay(response, attempt));
+        const response = await binding.fetch(targetRequest);
+        // هر پاسخی (حتی 5xx/429) همان چیزی است که Provider تولید کرده؛
+        // دوباره فراخوانی نکن — Provider خودش retry/چرخش کلید را انجام داده است.
+        return decorate(response, requestId, route.provider);
       } catch (error) {
-        clearTimeout(timer);
-        if (attempt === MAX_RETRIES) break;
-        await sleep(BASE_RETRY_DELAY_MS * (2 ** attempt) + Math.floor(Math.random() * 150));
+        lastError = error;
+        if (attempt < BINDING_RETRIES) {
+          await sleep(BASE_RETRY_DELAY_MS * (2 ** attempt) + Math.floor(Math.random() * 150));
+        }
       }
-    }
-
-    if (lastResponse) {
-      return decorate(lastResponse, requestId, route.provider, 0, attempt);
     }
 
     return json({
       error: "upstream_unavailable",
+      detail: lastError instanceof Error ? String(lastError.message) : "binding_fetch_failed",
       request_id: requestId,
       provider: route.provider,
     }, 502, { "x-request-id": requestId });
@@ -152,23 +152,10 @@ function stripPrefix(pathname, prefix) {
   return result || "/";
 }
 
-function retryDelay(response, attempt) {
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 10_000);
-    const date = Date.parse(retryAfter);
-    if (Number.isFinite(date)) return Math.min(Math.max(0, date - Date.now()), 10_000);
-  }
-  return BASE_RETRY_DELAY_MS * (2 ** attempt) + Math.floor(Math.random() * 150);
-}
-
-function decorate(response, requestId, provider, latencyMs, retryCount) {
+function decorate(response, requestId, provider) {
   const headers = new Headers(response.headers);
   headers.set("x-request-id", requestId);
   headers.set("x-omniroute-provider", provider);
-  headers.set("x-proxy-latency-ms", String(latencyMs));
-  headers.set("x-retry-count", String(retryCount));
   headers.set("cache-control", "no-store");
 
   const cors = corsHeaders();
