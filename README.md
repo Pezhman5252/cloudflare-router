@@ -1,19 +1,19 @@
-# OmniRoute Cloudflare Proxy V3
+# ۱. لاگین (اگر لازم است)
+wrangler login
 
-Purpose: use Cloudflare as the Base URL endpoint inside OmniRoute. OmniRoute sends its normal API requests to the selected Base URL; Cloudflare routes them to the configured provider.
+# ۲. ایجاد KV برای bai
+wrangler kv namespace create "USAGE_BAI"
 
-Configured routes:
+# ۳. ایجاد KV برای dahl
+wrangler kv namespace create "USAGE_DAHL"
 
-- `/a` -> `https://api.b.ai/v1`
-- `/b` -> `https://inference.dahl.global/v1`
+# ۴. IDهای دریافتی را در فایل‌های wrangler.toml قرار دهید.
 
-Examples:
+# ۵. تنظیم سکریت‌ها
+wrangler secret put ROUTER_API_KEY -c router/wrangler.toml
+wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
+wrangler secret put UPSTREAM_API_KEYS -c providers/dahl/wrangler.toml
 
-- `https://ROUTER/a/chat/completions` -> `https://api.b.ai/v1/chat/completions`
-- `https://ROUTER/b/chat/completions` -> `https://inference.dahl.global/v1/chat/completions`
-
-Architecture:
-
-OmniRoute -> Master Router Worker -> Service Binding -> Provider Worker -> Provider API
-
-Provider API keys are stored as Cloudflare Worker Secrets.
+# ۶. استقرار
+npm run deploy:providers
+npm run deploy:router
