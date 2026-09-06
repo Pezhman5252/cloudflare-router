@@ -242,6 +242,7 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
 | استریم تدریجی نیست (همه یکجا) | کلاینت/پروکسی واسط بافر می‌کند | با `curl.exe -N` مستقیم تست کنید؛ اگر مستقیم روان بود، مشکل از کلاینت شماست نه راوتر |
 | خطای مهاجرت DO هنگام deploy | tag مهاجرت تغییر کرده | `[[migrations]]` را دست نزنید — همان `v1` بماند |
 | `503 provider_binding_unavailable` | provider deploy نشده یا نامش عوض شده | `npm run deploy:providers` را اجرا کنید؛ نام‌ها در `[[services]]` راوتر باید با `name` providerها یکی باشد |
+| `dev:router` خطای binding می‌دهد | در dev محلی، providerهای `[[services]]` باید در دسترس باشند | اول providerها را deploy کنید یا از `wrangler dev --remote` استفاده کنید؛ در production واقعی binding خودکار کار می‌کند |
 
 ---
 

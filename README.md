@@ -144,3 +144,11 @@ npm run deploy
 ### Request body handling (V5.0.5)
 
 The router performs an early `Content-Length` rejection but does not buffer request bodies. Chunked/streamed bodies are forwarded directly through the Service Binding. The provider is the authoritative bounded replay boundary: it incrementally reads and buffers only up to `MAX_BODY_BYTES`, returning HTTP 413 when the limit is exceeded. This avoids buffering the same request body twice while preserving retry/failover replay.
+
+### V5.0.5 hardening notes
+
+- Stuck-reservation lease GC: a worker that dies between key selection and release can no longer pin a key (or an orphaned half-open probe) forever; reservations older than `max(UPSTREAM_TIMEOUT_MS + MAX_RETRY_TIME_MS + 60s, MAX_COOLDOWN_MS)` are reclaimed on the next selection.
+- Hop-by-hop headers are stripped at both the router and the provider; conditional-request (`if-none-match`, …), `Range` and `Expect` are stripped upstream so a cached 304 or clipped body can never corrupt usage accounting or retries. Upstream `Set-Cookie` never reaches clients.
+- `parseKeys` also accepts human-written bracket forms (`['a','b']`, `[key1, key2]`) instead of silently mangling them into wrong key IDs.
+- The router and provider parse `MAX_BODY_BYTES` identically (non-positive/non-numeric falls back to the default).
+- SSE passthrough bounds its line-remainder buffer so a hostile upstream cannot grow worker memory without limit.

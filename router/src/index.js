@@ -43,7 +43,11 @@ export default {
     // Apply an early Content-Length rejection without buffering the request.
     // Chunked/streamed bodies are bounded by the provider, which is the
     // authoritative replay boundary for retries and failover.
-    const maxBody = Number(env.MAX_BODY_BYTES || 10485760);
+    // Parse exactly like the provider does (runtimeConfig): a non-positive or
+    // non-numeric MAX_BODY_BYTES falls back to the default instead of, say,
+    // "0" silently rejecting every request with a body.
+    const maxBodyRaw = Number(env.MAX_BODY_BYTES);
+    const maxBody = Number.isFinite(maxBodyRaw) && maxBodyRaw > 0 ? maxBodyRaw : 10485760;
     const contentLengthHeader = request.headers.get("content-length");
     const contentLength = contentLengthHeader === null ? null : Number(contentLengthHeader);
     if (contentLength !== null && Number.isFinite(contentLength) && contentLength > maxBody) {

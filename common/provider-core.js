@@ -24,6 +24,7 @@ function parseKeys(value) {
   if (!raw) return [];
 
   // Preferred format: JSON array, which safely supports keys containing commas.
+  const looksLikeArray = raw.startsWith("[") && raw.endsWith("]");
   if (raw.startsWith("[")) {
     try {
       const parsed = JSON.parse(raw);
@@ -31,6 +32,30 @@ function parseKeys(value) {
         return [...new Set(parsed.map(v => String(v).trim()).filter(Boolean))];
       }
     } catch {}
+    // Human-written bracket forms that JSON.parse rejects: ['a','b'] or
+    // [key1, key2]. Scan with quote awareness so a quoted element may itself
+    // contain commas/semicolons, instead of letting the brackets leak into
+    // the keys themselves.
+    if (looksLikeArray) {
+      const inner = raw.slice(1, -1);
+      const parts = [];
+      let cur = "";
+      let quote = null;
+      for (const ch of inner) {
+        if (quote) {
+          if (ch === quote) quote = null; else cur += ch;
+        } else if (ch === "'" || ch === '"') {
+          quote = ch;
+        } else if (ch === "," || ch === "\n" || ch === ";") {
+          parts.push(cur); cur = "";
+        } else {
+          cur += ch;
+        }
+      }
+      parts.push(cur);
+      const cleaned = [...new Set(parts.map(s => s.trim()).filter(Boolean))];
+      if (cleaned.length) return cleaned;
+    }
   }
 
   // Recommended human-readable format is one key per line or semicolon-separated.
@@ -694,6 +719,10 @@ function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil) {
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || "";
       for (const line of lines) usage = mergeUsage(usage, parseSseLine(line));
+      // A hostile or broken upstream that never terminates a line could make
+      // this buffer grow without bound; parse everything complete, then drop
+      // the pathological remainder. The stream passthrough is unaffected.
+      if (buffer.length > 1000000) buffer = "";
     },
     async flush() {
       buffer += decoder.decode();

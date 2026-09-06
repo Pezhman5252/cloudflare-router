@@ -272,6 +272,27 @@ try {
     check("SSE usage events are summed", response.status === 200 && dayTokensColumn(row) === 10 && unknownUsageColumn(row) === 0);
   }
 
+  // 7b) A hostile SSE upstream with an unterminated multi-megabyte line must not
+  // grow the parser buffer without bound, and later usage events still count.
+  {
+    const t = makeEnv(["KEY_A"]);
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${"x".repeat(2000000)}`));
+        controller.enqueue(new TextEncoder().encode('\n\ndata: {"usage":{"total_tokens":5}}\n\n'));
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+    await t.runScript([new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })]);
+    const response = await handler(new Request("https://internal/stream"), t.env, t.ctx);
+    const text = await response.text();
+    await t.settle();
+    check("hostile unterminated SSE line is bounded and passthrough intact", response.status === 200 && text.includes('"total_tokens":5'));
+    const row = await statFor(t.coordinator, "KEY_A");
+    check("usage after a dropped remainder is still counted", dayTokensColumn(row) === 5 && unknownUsageColumn(row) === 0);
+  }
+
   // 8) SSE error must NOT bypass failover.
   {
     const t = makeEnv(["KEY_A", "KEY_B"]);
@@ -448,6 +469,8 @@ try {
   // 19) Configuration and bounded-body hardening.
   {
     const parsed = parseKeys('["key,with,commas","plain-key"]');
+    const bracketQuoted = parseKeys("['key,with,commas','plain']");
+    const bracketBare = parseKeys("[key1, key2]");
     const config = runtimeConfig({});
     const oversized = new Request("https://internal/upload", {
       method: "POST",
@@ -462,6 +485,8 @@ try {
     let rejected = false;
     try { await readBoundedBody(oversized, 10); } catch (error) { rejected = error?.name === "BodyTooLargeError"; }
     check("JSON key format preserves commas", parsed.length === 2 && parsed[0] === "key,with,commas");
+    check("single-quoted bracket key list parses", bracketQuoted.length === 2 && bracketQuoted[0] === "key,with,commas" && bracketQuoted[1] === "plain");
+    check("bare bracket key list parses", bracketBare.length === 2 && bracketBare[0] === "key1" && bracketBare[1] === "key2");
     check("default upstream timeout is 25 seconds", config.timeout === 25000);
     check("chunked body limit rejects before unbounded buffering", rejected);
   }
@@ -530,6 +555,11 @@ try {
     };
     const withCookie = await router.fetch(new Request("https://router/a/x", { headers: { authorization: "Bearer secret" } }), { ...env, BAI_WORKER: cookieWorker });
     check("upstream set-cookie never reaches the client", withCookie.status === 200 && withCookie.headers.get("set-cookie") === null);
+
+    const zeroLimit = await router.fetch(new Request("https://router/a/x", {
+      method: "POST", headers: { authorization: "Bearer secret" }, body: "abc",
+    }), { ...env, MAX_BODY_BYTES: "0" });
+    check("router MAX_BODY_BYTES=0 falls back to the default limit", zeroLimit.status === 200);
   }
 
   // 21) Provider also strips upstream set-cookie (defense in depth).
