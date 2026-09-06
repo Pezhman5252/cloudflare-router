@@ -1,4 +1,4 @@
-# OmniRoute v5 — Release Checklist
+# PolyRoute v5 — Release Checklist
 
 ## Automated checks
 

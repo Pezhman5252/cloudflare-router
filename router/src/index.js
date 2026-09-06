@@ -15,7 +15,7 @@ export default {
 
     // Health check
     if (url.pathname === "/health") {
-      return jsonResponse({ ok: true, service: "omniroute-master-proxy", version: "5.0.5" });
+      return jsonResponse({ ok: true, service: "polyroute-master-proxy", version: "5.0.5" });
     }
 
     // Route matching
@@ -76,7 +76,7 @@ export default {
     ];
     for (const h of removeHeaders) headers.delete(h);
     headers.set("x-request-id", reqId);
-    headers.set("x-omniroute-provider", route.provider);
+    headers.set("x-polyroute-provider", route.provider);
 
     const targetPath = url.pathname.slice(route.prefix.length) || "/";
     const targetUrl = `https://internal${targetPath}${url.search}`;
@@ -152,7 +152,7 @@ function decorateResponse(resp, reqId, provider) {
   // gateway's origin.
   headers.delete("set-cookie");
   headers.set("x-request-id", reqId);
-  headers.set("x-omniroute-provider", provider);
+  headers.set("x-polyroute-provider", provider);
   headers.set("cache-control", "no-store");
   for (const [k, v] of Object.entries(corsHeaders())) {
     headers.set(k, v);

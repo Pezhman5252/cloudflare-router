@@ -652,7 +652,7 @@ async function upstream(request, url, key, reqId, attempt, timeout, bodyBuffer, 
   // bypass the body and poison usage extraction), and request-modification
   // headers that would corrupt or clip the replayed body on retry.
   for (const header of [
-    "authorization", "x-api-key", "x-auth-token", "x-router-api-key", "x-omniroute-provider",
+    "authorization", "x-api-key", "x-auth-token", "x-router-api-key", "x-polyroute-provider",
     "host", "content-length", "cf-connecting-ip", "x-forwarded-for", "x-real-ip", "cf-worker",
     // hop-by-hop
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",

@@ -1,4 +1,4 @@
-# راهنمای کامل نصب — Cloudflare Router v5
+# راهنمای کامل نصب — PolyRoute v5
 
 این راهنما مخصوص پروژه‌ی **v5** (همین پوشه) است و مرحله‌به‌مرحله تا نصب کامل و تست واقعی پیش می‌رود. همه‌ی دستورها را **از داخل همین پوشه** اجرا کنید:
 
@@ -131,7 +131,7 @@ npx wrangler secret put ROUTER_API_KEY -c router/wrangler.toml
 npm run deploy:providers
 ```
 
-✅ **خروجی موردانتظار:** دو‌بار `Uploaded omniroute-provider-bai` / `omniroute-provider-dahl` + پیام مهاجرت Durable Object (`v1`) + نسخه/URL.
+✅ **خروجی موردانتظار:** دو‌بار `Uploaded polyroute-provider-bai` / `polyroute-provider-dahl` + پیام مهاجرت Durable Object (`v1`) + نسخه/URL.
 
 ⚠️ providerها عمداً هیچ URL عمومی ندارند (`workers_dev=false`) — این طبیعی و امن است.
 
@@ -139,10 +139,10 @@ npm run deploy:providers
 npm run deploy:router
 ```
 
-✅ **خروجی موردانتظار:** `Uploaded omniroute-master-proxy` و مهم‌تر از همه:
+✅ **خروجی موردانتظار:** `Uploaded polyroute-master-proxy` و مهم‌تر از همه:
 
 ```
-https://omniroute-master-proxy.<subdomain>.workers.dev
+https://polyroute-master-proxy.<subdomain>.workers.dev
 ```
 
 **این URL را کپی و ذخیره کنید** — آدرس عمومی سرویس شماست. (یک‌خطا یا خیر: `npm run deploy` هر دو را پشت‌سرهم انجام می‌دهد.)
@@ -151,11 +151,11 @@ https://omniroute-master-proxy.<subdomain>.workers.dev
 
 ## مرحله ۶ — تأیید نصب (سه تست واقعی)
 
-در همه‌ی دستورهای زیر، `https://omniroute-master-proxy.<subdomain>.workers.dev` را با URL مرحله ۵ و `ROUTER_API_KEY` را با کلید گیت‌وی خودتان جایگزین کنید.
+در همه‌ی دستورهای زیر، `https://polyroute-master-proxy.<subdomain>.workers.dev` را با URL مرحله ۵ و `ROUTER_API_KEY` را با کلید گیت‌وی خودتان جایگزین کنید.
 
 **۶-۱) Health check:**
 ```powershell
-Invoke-RestMethod "https://omniroute-master-proxy.<subdomain>.workers.dev/health"
+Invoke-RestMethod "https://polyroute-master-proxy.<subdomain>.workers.dev/health"
 ```
 ✅ **موردانتظار:** `ok : True` و `version : 5.0.5`
 
@@ -169,7 +169,7 @@ Invoke-RestMethod "https://omniroute-master-proxy.<subdomain>.workers.dev/health
 }
 ```
 ```powershell
-curl.exe -s "https://omniroute-master-proxy.<subdomain>.workers.dev/a/chat/completions" -H "Authorization: Bearer ROUTER_API_KEY" -H "Content-Type: application/json" -d "@body.json"
+curl.exe -s "https://polyroute-master-proxy.<subdomain>.workers.dev/a/chat/completions" -H "Authorization: Bearer ROUTER_API_KEY" -H "Content-Type: application/json" -d "@body.json"
 ```
 ✅ **موردانتظار:** پاسخ JSON عادی chat completion (همان شکل OpenAI).
 
@@ -182,7 +182,7 @@ curl.exe -s "https://omniroute-master-proxy.<subdomain>.workers.dev/a/chat/compl
 }
 ```
 ```powershell
-curl.exe -N "https://omniroute-master-proxy.<subdomain>.workers.dev/a/chat/completions" -H "Authorization: Bearer ROUTER_API_KEY" -H "Content-Type: application/json" -d "@body-stream.json"
+curl.exe -N "https://polyroute-master-proxy.<subdomain>.workers.dev/a/chat/completions" -H "Authorization: Bearer ROUTER_API_KEY" -H "Content-Type: application/json" -d "@body-stream.json"
 ```
 ✅ **موردانتظار:** قطعات متن به‌صورت تدریجی چاپ شود (رویدادهای `data: {...}`) و در انتها `data: [DONE]`. اگر متن ناگهانی و یکجا آمد، استریم نیست — به عیب‌یابی مراجعه کنید.
 
@@ -206,7 +206,7 @@ npx wrangler tail -c router/wrangler.toml --format pretty
 ## مرحله ۸ (توصیه‌شده قبل از استفاده‌ی جدی) — امنیت و پایداری
 
 - **WAF / Rate Limiting کلودفلر** را روی دامنه‌ی راوتر فعال کنید (داشبورد → Security).
-- **دامنه‌ی اختصاصی** (اختیاری): داشبورد → Workers → `omniroute-master-proxy` → Settings → Domains & Routes → Add Custom Domain.
+- **دامنه‌ی اختصاصی** (اختیاری): داشبورد → Workers → `polyroute-master-proxy` → Settings → Domains & Routes → Add Custom Domain.
 - **پایش هزینه:** داشبورد → Workers & Pages → Metrics. مصرف DO (هماهنگی کلیدها) بسیار جزئی است؛ هزینه‌ی اصلی، خود فراخوانی‌های upstream است.
 
 ---

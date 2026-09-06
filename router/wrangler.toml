@@ -1,4 +1,4 @@
-name="omniroute-master-proxy"
+name="polyroute-master-proxy"
 main="src/index.js"
 compatibility_date="2026-09-05"
 # آدرس عمومی workers.dev برای راوتر فعال باشد (کلید گیت‌وی آن را محافظت می‌کند)
@@ -10,11 +10,11 @@ mode="smart"
 
 [[services]]
 binding="BAI_WORKER"
-service="omniroute-provider-bai"
+service="polyroute-provider-bai"
 
 [[services]]
 binding="DAHL_WORKER"
-service="omniroute-provider-dahl"
+service="polyroute-provider-dahl"
 
 [vars]
 ENVIRONMENT="production"
