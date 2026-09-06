@@ -3,7 +3,7 @@
 این راهنما مخصوص پروژه‌ی **v5** (همین پوشه) است و مرحله‌به‌مرحله تا نصب کامل و تست واقعی پیش می‌رود. همه‌ی دستورها را **از داخل همین پوشه** اجرا کنید:
 
 ```powershell
-cd "C:\Users\Pezhman\Downloads\Pezhman - Copy\cloudflare-router\cloudflare-router"
+cd "C:\path\to\polyroute"
 ```
 
 > **نکته‌ی Windows:** اگر `npm` خطای «running scripts is disabled» داد، به‌جای آن از `npm.cmd` استفاده کنید یا یک‌بار این را اجرا کنید:
