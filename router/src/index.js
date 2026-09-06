@@ -2,6 +2,7 @@
 const ROUTES = [
   { prefix: "/a", binding: "BAI_WORKER", provider: "bai" },
   { prefix: "/b", binding: "DAHL_WORKER", provider: "dahl" },
+  { prefix: "/c", binding: "TOKENROUTER_WORKER", provider: "tokenrouter" },
 ].sort((a, b) => b.prefix.length - a.prefix.length);
 
 export default {

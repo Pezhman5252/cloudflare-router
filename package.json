@@ -9,14 +9,16 @@
     "test:syntax": "node --check common/provider-core.js && node --check router/src/index.js && node --check providers/bai/src/index.js && node --check providers/dahl/src/index.js",
     "test:all": "npm run test:syntax && npm run test:static && npm test",
     "deploy": "npm run deploy:providers && npm run deploy:router",
-    "deploy:providers": "npm run deploy:bai && npm run deploy:dahl",
+    "deploy:providers": "npm run deploy:bai && npm run deploy:dahl && npm run deploy:tokenrouter",
     "deploy:bai": "wrangler deploy -c providers/bai/wrangler.toml",
     "deploy:dahl": "wrangler deploy -c providers/dahl/wrangler.toml",
+    "deploy:tokenrouter": "wrangler deploy -c providers/tokenrouter/wrangler.toml",
     "deploy:router": "wrangler deploy -c router/wrangler.toml",
     "dev:bai": "wrangler dev -c providers/bai/wrangler.toml",
     "dev:dahl": "wrangler dev -c providers/dahl/wrangler.toml",
+    "dev:tokenrouter": "wrangler dev -c providers/tokenrouter/wrangler.toml",
     "dev:router": "wrangler dev -c router/wrangler.toml",
-    "check": "wrangler deploy --dry-run -c providers/bai/wrangler.toml && wrangler deploy --dry-run -c providers/dahl/wrangler.toml && wrangler deploy --dry-run -c router/wrangler.toml"
+    "check": "wrangler deploy --dry-run -c providers/bai/wrangler.toml && wrangler deploy --dry-run -c providers/dahl/wrangler.toml && wrangler deploy --dry-run -c providers/tokenrouter/wrangler.toml && wrangler deploy --dry-run -c router/wrangler.toml"
   },
   "devDependencies": {
     "wrangler": "4.129.0"

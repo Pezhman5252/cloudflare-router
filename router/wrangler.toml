@@ -16,6 +16,10 @@ service="polyroute-provider-bai"
 binding="DAHL_WORKER"
 service="polyroute-provider-dahl"
 
+[[services]]
+binding="TOKENROUTER_WORKER"
+service="polyroute-provider-tokenrouter"
+
 [vars]
 ENVIRONMENT="production"
 MAX_BODY_BYTES="10485760"

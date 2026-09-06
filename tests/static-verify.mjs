@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const configs = ["providers/bai/wrangler.toml", "providers/dahl/wrangler.toml", "router/wrangler.toml"];
+const configs = ["providers/bai/wrangler.toml", "providers/dahl/wrangler.toml", "providers/tokenrouter/wrangler.toml", "router/wrangler.toml"];
 let failed = 0;
 function check(name, ok) { if (ok) console.log(`✔ ${name}`); else { failed++; console.error(`✘ ${name}`); } }
 for (const file of configs) {
