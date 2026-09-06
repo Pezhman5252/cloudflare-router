@@ -48,7 +48,8 @@ Upstream API
 - برای HALF_OPEN فقط یک probe هم‌زمان مجاز است.
 - retry دارای سقف attempt، backoff و total retry time است.
 - Master Router عمداً retry نمی‌کند تا retry ضربدری ایجاد نشود.
-- POST/PUT/PATCH قبل از failover یک‌بار buffer می‌شوند و هر attempt body مستقل دارد.
+- POST/PUT/PATCH قبل از failover یک‌بار buffer می‌شوند (تا سقف `MAX_BODY_BYTES`) و هر attempt همان body یکسان را replay می‌کند.
+- اگر فرآیند Worker بین انتخاب کلید و release از بین برود، lease `reserved_at` در next انتخاب، رزروasion و probe یتیم را پس از انقضای lease آزاد می‌کند (پوشش test 14b).
 - فقط SSE موفق وارد streaming می‌شود؛ SSE با status خطا وارد failover عادی می‌شود.
 - SSE usage حتی وقتی JSON در چند chunk تقسیم شده باشد استخراج می‌شود.
 - `inflight` در release/cancel آزاد می‌شود و در خطاهای داخلی نیز مسیر cleanup دارد.
@@ -135,11 +136,11 @@ npm run deploy
 جزئیات gate انتشار در `RELEASE_CHECKLIST.md` است.
 
 
-## API key configuration (V5.0.4)
+## API key configuration (V5.0.5)
 
 `UPSTREAM_API_KEYS` accepts the legacy comma-separated format, semicolon/newline-separated values, or a JSON array. Use the JSON-array form when a provider key itself can contain commas, for example `[`"`key,with,commas`"`]`. The provider worker enforces the configured body limit incrementally and buffers only up to that limit because request replay is required for failover retries.
 
 
-### Request body handling (V5.0.4)
+### Request body handling (V5.0.5)
 
 The router performs an early `Content-Length` rejection but does not buffer request bodies. Chunked/streamed bodies are forwarded directly through the Service Binding. The provider is the authoritative bounded replay boundary: it incrementally reads and buffers only up to `MAX_BODY_BYTES`, returning HTTP 413 when the limit is exceeded. This avoids buffering the same request body twice while preserving retry/failover replay.

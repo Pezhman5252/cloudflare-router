@@ -15,7 +15,7 @@ export default {
 
     // Health check
     if (url.pathname === "/health") {
-      return jsonResponse({ ok: true, service: "omniroute-master-proxy", version: "5.0.4" });
+      return jsonResponse({ ok: true, service: "omniroute-master-proxy", version: "5.0.5" });
     }
 
     // Route matching
@@ -31,7 +31,7 @@ export default {
     }
     const supplied = request.headers.get("x-router-api-key") ||
                      (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-    if (!timingSafeEqual(String(supplied).trim(), gatewayKey)) {
+    if (!timingSafeEqual(String(supplied).trim(), String(gatewayKey).trim())) {
       return jsonResponse({ error: "unauthorized" }, 401, { "www-authenticate": "Bearer" });
     }
 
@@ -57,9 +57,18 @@ export default {
 
     // ساخت درخواست داخلی
     const headers = new Headers(request.headers);
+    // Credentials and client identity never reach the provider; hop-by-hop
+    // headers are removed and framing headers (host/content-length) are left
+    // for the runtime to recompute, so the Service Binding request cannot
+    // smuggle identity or stall on an unmatched Expect.
     const removeHeaders = [
       "authorization", "x-api-key", "x-auth-token", "x-router-api-key",
-      "host", "content-length", "cf-connecting-ip", "x-forwarded-for", "x-real-ip"
+      "host", "content-length", "cf-connecting-ip", "x-forwarded-for", "x-real-ip",
+      // hop-by-hop
+      "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+      "te", "trailer", "transfer-encoding", "upgrade",
+      // request-modification
+      "expect"
     ];
     for (const h of removeHeaders) headers.delete(h);
     headers.set("x-request-id", reqId);
@@ -135,6 +144,9 @@ function corsHeaders() {
 
 function decorateResponse(resp, reqId, provider) {
   const headers = new Headers(resp.headers);
+  // Defense in depth: an upstream/provider must never set cookies on the
+  // gateway's origin.
+  headers.delete("set-cookie");
   headers.set("x-request-id", reqId);
   headers.set("x-omniroute-provider", provider);
   headers.set("cache-control", "no-store");

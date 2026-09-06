@@ -46,12 +46,6 @@ async function keyId(key) {
   return `k_${hex}`;
 }
 
-async function keyMap(value) {
-  const map = new Map();
-  for (const key of parseKeys(value)) map.set(await keyId(key), key);
-  return map;
-}
-
 function validId(v) {
   return !!v && /^[A-Za-z0-9._:=+@-]{1,128}$/.test(v);
 }
@@ -125,6 +119,8 @@ function isStreamResponse(response) {
 
 function responseHeaders(response, reqId) {
   const headers = new Headers(response.headers);
+  // An upstream must never be able to set cookies on the gateway's origin.
+  headers.delete("set-cookie");
   headers.set("x-request-id", reqId);
   headers.set("cache-control", "no-store");
   return headers;
@@ -243,6 +239,7 @@ export class ApiKeyCoordinator extends DurableObject {
           last_used INTEGER NOT NULL DEFAULT 0,
           last_success INTEGER NOT NULL DEFAULT 0,
           last_failure INTEGER NOT NULL DEFAULT 0,
+          reserved_at INTEGER NOT NULL DEFAULT 0,
           day_start INTEGER NOT NULL DEFAULT 0,
           day_tokens INTEGER NOT NULL DEFAULT 0,
           day_requests INTEGER NOT NULL DEFAULT 0,
@@ -289,6 +286,7 @@ export class ApiKeyCoordinator extends DurableObject {
         known_usage_requests: "INTEGER NOT NULL DEFAULT 0",
         unknown_usage_requests: "INTEGER NOT NULL DEFAULT 0",
         circuit_open_count: "INTEGER NOT NULL DEFAULT 0",
+        reserved_at: "INTEGER NOT NULL DEFAULT 0",
       };
       for (const [name, definition] of Object.entries(additions)) {
         if (!existing.has(name)) this.sql.exec(`ALTER TABLE keys ADD COLUMN ${name} ${definition}`);
@@ -302,6 +300,7 @@ export class ApiKeyCoordinator extends DurableObject {
       this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_quota ON keys(day_tokens, month_tokens)`);
       this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_inflight_last_used ON keys(inflight, last_used)`);
       this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_failures ON keys(consecutive_failures)`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_reserved_at ON keys(reserved_at)`);
 
       if (typeof ctx.storage.setAlarm === "function") {
         await ctx.storage.setAlarm(nextUtcMidnight(Date.now()));
@@ -363,10 +362,27 @@ export class ApiKeyCoordinator extends DurableObject {
     const map = new Map();
     for (const key of keys) map.set(await keyId(key), key);
     const now = Date.now();
+    const config = runtimeConfig(this.env);
     this.resetWindows(now);
+
+    // Stuck-reservation recovery. Every select stamps reserved_at, so a worker
+    // that dies between select and release cannot pin a key forever: a
+    // forgotten half_open_probe would deadlock the key (no further probe is
+    // ever granted) and a stranded inflight reservation would skew load
+    // balancing and block removal of a rotated key. The lease is deliberately
+    // long — well beyond UPSTREAM_TIMEOUT_MS and any legitimate SSE stream —
+    // so live reservations are never disturbed.
+    const lease = Math.max(config.timeout + config.maxRetryTime + 60000, config.maxCooldown);
+    this.sql.exec(`
+      UPDATE keys
+      SET inflight=CASE WHEN inflight>0 THEN 0 ELSE inflight END,
+          half_open_probe=0,
+          state=CASE WHEN half_open_probe>0 THEN 'open' ELSE state END
+      WHERE reserved_at>0 AND reserved_at<? AND (inflight>0 OR half_open_probe>0)
+    `, now - lease);
+
     const day = dayStart(now);
     const month = monthStart(now);
-    const config = runtimeConfig(this.env);
     const exclude = Array.isArray(data.exclude) ? data.exclude.filter(validId) : [];
     const allowDegraded = Boolean(data.allow_degraded);
     const allowHalfOpen = Boolean(data.allow_half_open);
@@ -417,6 +433,7 @@ export class ApiKeyCoordinator extends DurableObject {
         WHERE id=? AND (cooldown=0 OR cooldown<=?)
           AND (?=0 OR day_tokens<?) AND (?=0 OR month_tokens<?)
           AND state IN ('degraded','open')
+          AND half_open_probe=0
         LIMIT 1
       `, data.retry_key, now,
          config.dailyTokenLimit > 0 ? 1 : 0, config.dailyTokenLimit,
@@ -424,10 +441,15 @@ export class ApiKeyCoordinator extends DurableObject {
     }
     if (!rows.length) return Response.json({ error: "no_healthy_api_key" }, { status: 503 });
 
-    const [kid, state, cooldown, inflight, dayTokens, monthTokens, dayRequests, failures, latency, lastUsed, probe] = rows[0];
+    // Selected row columns: 0=id 1=state 2=cooldown 10=half_open_probe.
+    const row = rows[0];
+    const kid = row[0];
+    const state = String(row[1]);
+    const cooldown = Number(row[2]);
+    const halfOpenProbe = Number(row[10]);
     const isProbe = (state === "open" || state === "invalid" || state === "rate_limited") && cooldown <= now;
     const isHalfOpen = isProbe && (state === "open" ? allowHalfOpen : true);
-    if (isHalfOpen && Number(probe) > 0) return Response.json({ error: "no_healthy_api_key" }, { status: 503 });
+    if (isHalfOpen && halfOpenProbe > 0) return Response.json({ error: "no_healthy_api_key" }, { status: 503 });
 
     const nextState = isHalfOpen ? "half_open" : state;
     this.sql.exec(`
@@ -435,10 +457,11 @@ export class ApiKeyCoordinator extends DurableObject {
         inflight=inflight+1,
         requests=requests+1,
         last_used=?,
+        reserved_at=?,
         state=?,
         half_open_probe=?
       WHERE id=?
-    `, now, nextState, isHalfOpen ? 1 : 0, kid);
+    `, now, now, nextState, isHalfOpen ? 1 : 0, kid);
 
     return Response.json({ key_id: kid, api_key: map.get(kid), day_start: day, month_start: month });
   }
@@ -512,6 +535,7 @@ export class ApiKeyCoordinator extends DurableObject {
         auth401=auth401+?, auth403=auth403+?,
         timeouts=timeouts+?, network_errors=network_errors+?, transient5xx=transient5xx+?,
         failures=?, consecutive_failures=?, latency=?, state=?, cooldown=?, half_open_probe=?,
+        reserved_at=0,
         last_success=CASE WHEN ? THEN ? ELSE last_success END,
         last_failure=CASE WHEN ? THEN ? ELSE last_failure END,
         day_start=?, day_tokens=day_tokens+?, day_requests=day_requests+1,
@@ -541,7 +565,7 @@ export class ApiKeyCoordinator extends DurableObject {
 
   async cancel(data = {}) {
     const kid = String(data.key_id || "");
-    this.sql.exec(`UPDATE keys SET inflight=CASE WHEN inflight>0 THEN inflight-1 ELSE 0 END, half_open_probe=0 WHERE id=?`, kid);
+    this.sql.exec(`UPDATE keys SET inflight=CASE WHEN inflight>0 THEN inflight-1 ELSE 0 END, half_open_probe=0, reserved_at=0 WHERE id=?`, kid);
     return Response.json({ ok: true });
   }
 
@@ -598,9 +622,20 @@ async function readBoundedBody(request, maxBytes) {
 
 async function upstream(request, url, key, reqId, attempt, timeout, bodyBuffer, authMode) {
   const headers = new Headers(request.headers);
+  // Credentials (never forward the client's or the router's identity), DO
+  // routing artifacts, conditional-request headers (a cached 304 upstream would
+  // bypass the body and poison usage extraction), and request-modification
+  // headers that would corrupt or clip the replayed body on retry.
   for (const header of [
     "authorization", "x-api-key", "x-auth-token", "x-router-api-key", "x-omniroute-provider",
-    "host", "content-length", "cf-connecting-ip", "x-forwarded-for", "x-real-ip"
+    "host", "content-length", "cf-connecting-ip", "x-forwarded-for", "x-real-ip", "cf-worker",
+    // hop-by-hop
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+    // conditional request
+    "if-modified-since", "if-none-match", "if-match", "if-unmodified-since", "if-range",
+    // request-modification
+    "range", "expect"
   ]) headers.delete(header);
   if (authMode === "x-api-key") headers.set("x-api-key", key);
   else headers.set("authorization", `Bearer ${key}`);
@@ -627,14 +662,6 @@ async function releaseKey(coord, data) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(data),
-  });
-}
-
-async function cancelKey(coord, keyIdValue) {
-  return coord.fetch("https://coordinator/cancel", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ key_id: keyIdValue }),
   });
 }
 

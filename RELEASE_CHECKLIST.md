@@ -14,7 +14,7 @@ npm run check
 
 - syntax: PASS
 - static configuration: PASS
-- V5 verification: **25 passed, 0 failed** (or higher if more tests are added)
+- V5 verification: **48 passed, 0 failed** (or higher if more tests are added)
 
 `npm run check` must complete successfully for all three Wrangler configurations.
 

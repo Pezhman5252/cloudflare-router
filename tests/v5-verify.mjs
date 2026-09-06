@@ -115,7 +115,17 @@ function makeEnv(keys, overrides = {}) {
   const ctx = { tasks: [], waitUntil(p) { this.tasks.push(Promise.resolve(p).catch(() => {})); } };
   const fetchMock = async req => {
     const body = req.body === null ? null : await req.text();
-    calls.push({ authorization: req.headers.get("authorization"), apiKey: req.headers.get("x-api-key"), body, attempt: req.headers.get("x-provider-attempt") });
+    calls.push({
+      authorization: req.headers.get("authorization"),
+      apiKey: req.headers.get("x-api-key"),
+      body,
+      attempt: req.headers.get("x-provider-attempt"),
+      connection: req.headers.get("connection"),
+      expect: req.headers.get("expect"),
+      ifNoneMatch: req.headers.get("if-none-match"),
+      routerApiKey: req.headers.get("x-router-api-key"),
+      xRequestId: req.headers.get("x-request-id"),
+    });
     const script = env.__script;
     const step = script[Math.min(env.__index++, script.length - 1)];
     if (step instanceof Error) throw step;
@@ -161,11 +171,25 @@ try {
       new Response(JSON.stringify({ ok: true, usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }), { status: 200, headers: { "content-type": "application/json" } }),
     ]);
     const body = JSON.stringify({ model: "x", messages: [{ role: "user", content: "hi" }] });
-    const response = await handler(new Request("https://internal/chat", { method: "POST", headers: { "content-type": "application/json" }, body }), t.env, t.ctx);
+    const response = await handler(new Request("https://internal/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        connection: "keep-alive",
+        expect: "100-continue",
+        "if-none-match": '"etag-1"',
+        "x-router-api-key": "leak-me",
+      },
+      body,
+    }), t.env, t.ctx);
     await t.settle();
     check("401 failover returns 200", response.status === 200);
     check("POST body replay is byte-identical", t.calls.length === 2 && t.calls[0].body === body && t.calls[1].body === body);
     check("failover changes API key", t.calls.length === 2 && t.calls[0]?.authorization !== t.calls[1]?.authorization);
+    check("hop-by-hop and conditional headers are stripped upstream", t.calls.length === 2 && t.calls.every(c =>
+      c.connection === null && c.expect === null && c.ifNoneMatch === null && c.routerApiKey === null));
+    check("upstream authorization carries only provider keys", t.calls.length === 2 && t.calls.every(c =>
+      typeof c.authorization === "string" && c.authorization.startsWith("Bearer KEY_")));
     const failedKey = t.calls[0]?.authorization?.replace(/^Bearer\s+/, "");
     const a = await statFor(t.coordinator, failedKey);
     check("401 key enters quarantine", !!a && stateColumn(a) === "invalid" && cooldownColumn(a) > Date.now());
@@ -248,7 +272,7 @@ try {
     check("SSE usage events are summed", response.status === 200 && dayTokensColumn(row) === 10 && unknownUsageColumn(row) === 0);
   }
 
-  // 9) SSE error must NOT bypass failover.
+  // 8) SSE error must NOT bypass failover.
   {
     const t = makeEnv(["KEY_A", "KEY_B"]);
     await t.runScript([
@@ -325,6 +349,41 @@ try {
     await api.fetch(new Request("https://coordinator/release", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key_id: selected.key_id, status: 200, usage_known: false }) }));
     const removed = !(await stats(coordinator)).some(row => row[0] === selected.key_id);
     check("key rotation keeps in-flight key until release", retained && removed);
+  }
+
+  // 14b) A worker that dies between select and release cannot pin a key forever:
+  // the lease GC clears the stuck half_open_probe so the circuit can recover.
+  {
+    const env = { UPSTREAM_API_KEYS: "A", TRANSIENT_COOLDOWN_MS: "5", MAX_COOLDOWN_MS: "100" };
+    const { coordinator, api } = makeCoordinator(env);
+    const first = await (await api.fetch(new Request("https://coordinator/select", { method: "POST", body: "{}" }))).json();
+    // Drive the circuit open with three transient failures.
+    for (let i = 0; i < 3; i++) {
+      await api.fetch(new Request("https://coordinator/release", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key_id: first.key_id, status: 500, usage_known: false }),
+      }));
+    }
+    await new Promise(r => setTimeout(r, 10)); // let the transient cooldown lapse
+    const probe = await (await api.fetch(new Request("https://coordinator/select", { method: "POST", body: JSON.stringify({ allow_half_open: true }) }))).json();
+    check("half-open probe is granted on an open circuit", !!probe.key_id);
+    // The probe worker dies: backdate its lease beyond the GC threshold.
+    coordinator.ctx.storage.sql.exec("UPDATE keys SET reserved_at = ?", Date.now() - 1000000);
+    const recovered = await (await api.fetch(new Request("https://coordinator/select", { method: "POST", body: JSON.stringify({ allow_half_open: true }) }))).json();
+    check("lease GC revives a stuck half-open probe", !!recovered.key_id && recovered.key_id === probe.key_id);
+    const row = await statFor(coordinator, "A");
+    check("recovered probe holds exactly one live reservation", stateColumn(row) === "half_open" && inflightColumn(row) === 1);
+  }
+
+  // 14c) Live reservations are never disturbed by the lease GC.
+  {
+    const env = { UPSTREAM_API_KEYS: "A,B" };
+    const { coordinator, api } = makeCoordinator(env);
+    const s1 = await (await api.fetch(new Request("https://coordinator/select", { method: "POST", body: "{}" }))).json();
+    const s2 = await (await api.fetch(new Request("https://coordinator/select", { method: "POST", body: "{}" }))).json();
+    const rows = await stats(coordinator);
+    const live = rows.filter(row => [s1.key_id, s2.key_id].includes(row[0]));
+    check("fresh reservations survive GC", live.length === 2 && live.every(row => inflightColumn(row) === 1));
   }
 
   // 15) 403 is quarantined and does not consume the next key.
@@ -449,6 +508,37 @@ try {
     }), { ...env, MAX_BODY_BYTES: "32" });
     const lastCall = calls.at(-1);
     check("router forwards chunked body without duplex dependency", forwarded.status === 200 && lastCall && await lastCall.text() === "hello world");
+
+    const hopByHop = await router.fetch(new Request("https://router/a/x", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer secret",
+        connection: "keep-alive",
+        expect: "100-continue",
+        "x-forwarded-for": "203.0.113.9",
+      },
+      body: "ping",
+    }), env);
+    check("router strips hop-by-hop and identity headers before forwarding", hopByHop.status === 200 && calls.at(-1) &&
+      calls.at(-1).headers.get("connection") === null &&
+      calls.at(-1).headers.get("expect") === null &&
+      calls.at(-1).headers.get("x-forwarded-for") === null &&
+      calls.at(-1).headers.get("authorization") === null);
+
+    const cookieWorker = {
+      fetch: async () => new Response("ok", { status: 200, headers: { "set-cookie": "session=upstream" } }),
+    };
+    const withCookie = await router.fetch(new Request("https://router/a/x", { headers: { authorization: "Bearer secret" } }), { ...env, BAI_WORKER: cookieWorker });
+    check("upstream set-cookie never reaches the client", withCookie.status === 200 && withCookie.headers.get("set-cookie") === null);
+  }
+
+  // 21) Provider also strips upstream set-cookie (defense in depth).
+  {
+    const t = makeEnv(["KEY_A"]);
+    await t.runScript([new Response("ok", { status: 200, headers: { "set-cookie": "sid=upstream" } })]);
+    const response = await handler(new Request("https://internal/x"), t.env, t.ctx);
+    await t.settle();
+    check("provider strips upstream set-cookie", response.status === 200 && response.headers.get("set-cookie") === null);
   }
 
   console.log(`\nRESULT: ${passed} passed, ${failed} failed`);

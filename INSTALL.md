@@ -15,7 +15,7 @@ cd "C:\Users\Pezhman\Downloads\Pezhman - Copy\cloudflare-router\cloudflare-route
 
 | نیاز | بررسی |
 |------|-------|
-| Node.js نسخه ۲۰ یا بالاتر | `node --version` |
+| Node.js نسخه ۲۲ یا بالاتر (wrangler 4 به Node 22+ نیاز دارد) | `node --version` |
 | npm | `npm --version` |
 | حساب Cloudflare | [dash.cloudflare.com](https://dash.cloudflare.com) — پلن رایگان کافی است (Durable Object با SQLite در پلن رایگان پشتیبانی می‌شود) |
 | کلید API از BAI و Dahl | از پنل هر سرویس |
@@ -65,7 +65,7 @@ npm install
 node tests/v5-verify.mjs
 ```
 
-✅ **خروجی موردانتظار:** عبارت `═══ نتیجه v5 فیکس‌شده: 31 موفق، 0 ناموفق ═══`
+✅ **خروجی موردانتظار:** عبارت `RESULT: 48 passed, 0 failed`
 
 این تست کد واقعی را با Durable Object و SQLite واقعی اجرا می‌کند. اگر این مرحله سبز نبود، جلوتر نروید.
 
@@ -157,7 +157,7 @@ https://omniroute-master-proxy.<subdomain>.workers.dev
 ```powershell
 Invoke-RestMethod "https://omniroute-master-proxy.<subdomain>.workers.dev/health"
 ```
-✅ **موردانتظار:** `ok : True` و `version : 5.0.4`
+✅ **موردانتظار:** `ok : True` و `version : 5.0.5`
 
 **۶-۲) درخواست واقعی غیراستریم** (به BAI از طریق مسیر `/a/...`):
 
@@ -247,7 +247,7 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
 
 ## چک‌لیست نهایی نصب
 
-- [ ] `node tests/v5-verify.mjs` → 31 موفق، 0 ناموفق
+- [ ] `node tests/v5-verify.mjs` → 48 passed, 0 failed
 - [ ] `npx wrangler whoami` → حساب درست
 - [ ] سه secret گذاشته شد (BAI / Dahl / ROUTER_API_KEY)
 - [ ] `AUTH_MODE` و `UPSTREAM_BASE_URL` هر دو provider با مستندات واقعی‌شان مطابقت دارد
