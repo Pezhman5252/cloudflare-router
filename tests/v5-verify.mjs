@@ -123,6 +123,7 @@ function makeEnv(keys, overrides = {}) {
       connection: req.headers.get("connection"),
       expect: req.headers.get("expect"),
       ifNoneMatch: req.headers.get("if-none-match"),
+      acceptEncoding: req.headers.get("accept-encoding"),
       routerApiKey: req.headers.get("x-router-api-key"),
       xRequestId: req.headers.get("x-request-id"),
     });
@@ -178,6 +179,7 @@ try {
         connection: "keep-alive",
         expect: "100-continue",
         "if-none-match": '"etag-1"',
+        "accept-encoding": "zstd, gzip, br",
         "x-router-api-key": "leak-me",
       },
       body,
@@ -188,6 +190,8 @@ try {
     check("failover changes API key", t.calls.length === 2 && t.calls[0]?.authorization !== t.calls[1]?.authorization);
     check("hop-by-hop and conditional headers are stripped upstream", t.calls.length === 2 && t.calls.every(c =>
       c.connection === null && c.expect === null && c.ifNoneMatch === null && c.routerApiKey === null));
+    check("exotic client encodings are not negotiated upstream", t.calls.length === 2 && t.calls.every(c =>
+      c.acceptEncoding === null || /^(gzip(\s*,\s*gzip)?|identity|\*)$/.test(String(c.acceptEncoding).trim())));
     check("upstream authorization carries only provider keys", t.calls.length === 2 && t.calls.every(c =>
       typeof c.authorization === "string" && c.authorization.startsWith("Bearer KEY_")));
     const failedKey = t.calls[0]?.authorization?.replace(/^Bearer\s+/, "");
@@ -438,6 +442,27 @@ try {
     const text = await response.text();
     await t.settle();
     check("healthy stream is passed through with no truncation trailer", !text.includes("upstream_stream_truncated") && text.includes("data: [DONE]"));
+  }
+
+  // 7g) A content-encoded SSE body must never receive byte-level injections
+  // (heartbeat comments or the truncation trailer): injecting plaintext into
+  // an encoded stream would corrupt it and recreate the truncation bug.
+  {
+    const t = makeEnv(["KEY_A"], { SSE_HEARTBEAT_MS: "40" });
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc.encode('data: {"usage":{"total_tokens":1}}\n\n'));
+        controller.close();
+      },
+    });
+    await t.runScript([new Response(stream, { status: 200, headers: { "content-type": "text/event-stream", "content-encoding": "gzip" } })]);
+    const response = await handler(new Request("https://internal/stream"), t.env, t.ctx);
+    const text = await response.text();
+    await t.settle();
+    check("encoded SSE streams carry no heartbeat or trailer injection", !text.includes(": keep-alive") && !text.includes("upstream_stream_truncated"));
+    const row = await statFor(t.coordinator, "KEY_A");
+    check("encoded stream still releases the key", inflightColumn(row) === 0);
   }
 
   // 8) SSE error must NOT bypass failover.

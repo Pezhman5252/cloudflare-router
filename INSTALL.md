@@ -65,7 +65,7 @@ npm install
 node tests/v5-verify.mjs
 ```
 
-✅ **خروجی موردانتظار:** عبارت `RESULT: 70 passed, 0 failed`
+✅ **خروجی موردانتظار:** عبارت `RESULT: 73 passed, 0 failed`
 
 این تست کد واقعی را با Durable Object و SQLite واقعی اجرا می‌کند. اگر این مرحله سبز نبود، جلوتر نروید.
 
@@ -157,7 +157,7 @@ https://polyroute-master-proxy.<subdomain>.workers.dev
 ```powershell
 Invoke-RestMethod "https://polyroute-master-proxy.<subdomain>.workers.dev/health"
 ```
-✅ **موردانتظار:** `ok : True` و `version : 5.0.8`
+✅ **موردانتظار:** `ok : True` و `version : 5.0.9`
 
 **۶-۲) درخواست واقعی غیراستریم** (به BAI از طریق مسیر `/a/...`):
 
@@ -250,7 +250,7 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
 
 ## چک‌لیست نهایی نصب
 
-- [ ] `node tests/v5-verify.mjs` → 70 passed, 0 failed
+- [ ] `node tests/v5-verify.mjs` → 73 passed, 0 failed
 - [ ] `npx wrangler whoami` → حساب درست
 - [ ] سه secret گذاشته شد (BAI / Dahl / ROUTER_API_KEY)
 - [ ] `AUTH_MODE` و `UPSTREAM_BASE_URL` هر دو provider با مستندات واقعی‌شان مطابقت دارد

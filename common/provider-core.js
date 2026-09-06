@@ -679,7 +679,13 @@ async function upstream(request, url, key, reqId, attempt, timeout, bodyBuffer, 
     // conditional request
     "if-modified-since", "if-none-match", "if-match", "if-unmodified-since", "if-range",
     // request-modification
-    "range", "expect"
+    "range", "expect",
+    // The runtime transparently decompresses gzip/br responses; anything more
+    // exotic (zstd, deflate variants) would be forwarded byte-identical, which
+    // both breaks SSE parsing for the proxy and forbids the byte-level
+    // keep-alive/trailer injections. Pin the negotiation to encodings the
+    // runtime can always decode.
+    "accept-encoding"
   ]) headers.delete(header);
   if (authMode === "x-api-key") headers.set("x-api-key", key);
   else headers.set("authorization", `Bearer ${key}`);
@@ -718,6 +724,12 @@ function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil, ke
     `data: {"error":{"message":"upstream stream ended before finish_reason (connection closed mid-stream)","type":"upstream_stream_truncated","code":"upstream_stream_truncated"}}\n\ndata: [DONE]\n\n`
   );
   const FINISH_RE = /"finish_reason"\s*:\s*"(?!null)/;
+  // Byte-level injection (keep-alive comments, truncation trailer) is only
+  // valid on an uncompressed body. If the upstream negotiated a content
+  // encoding we did not ask for, injecting plaintext would corrupt the
+  // encoded stream — recreating the very truncation we are defending
+  // against — so an encoded body is passed through completely untouched.
+  const hasContentEncoding = Boolean(response.headers.get("content-encoding"));
   let buffer = "";
   let usage = null;
   let released = false;
@@ -754,7 +766,7 @@ function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil, ke
       // experiences as "Stream ended without finish_reason". SSE comments are
       // ignored by every parser, so a periodic keep-alive comment keeps every
       // hop alive without touching the payload.
-      if (!(keepAliveMs > 0)) return;
+      if (!(keepAliveMs > 0) || hasContentEncoding) return;
       heartbeatTimer = setInterval(() => {
         if (Date.now() - lastActivity < keepAliveMs) return;
         try { controller.enqueue(keepAliveBytes); } catch {}
@@ -801,13 +813,16 @@ function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil, ke
         // carrying a structured, self-describing error, then [DONE], so the
         // client always sees a complete, parseable stream and can surface our
         // explicit truncation marker instead of a generic transport failure.
+        // (Never inject into a content-encoded body — that would corrupt it.)
         const durationMs = Date.now() - start;
         if (upstreamBroken) {
           log("error", "Upstream stream broke without finish signal", `duration_ms=${durationMs}`, `usage_known=${Boolean(usage)}`);
         } else {
           log("warn", "SSE stream ended without finish signal", `duration_ms=${durationMs}`, `usage_known=${Boolean(usage)}`);
         }
-        try { controller.enqueue(TRUNCATED_TRAIL_BYTES); } catch {}
+        if (!hasContentEncoding) {
+          try { controller.enqueue(TRUNCATED_TRAIL_BYTES); } catch {}
+        }
       }
       await release();
     },

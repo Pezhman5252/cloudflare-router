@@ -16,7 +16,7 @@ export default {
 
     // Health check
     if (url.pathname === "/health") {
-      return jsonResponse({ ok: true, service: "polyroute-master-proxy", version: "5.0.8" });
+      return jsonResponse({ ok: true, service: "polyroute-master-proxy", version: "5.0.9" });
     }
 
     // Route matching
