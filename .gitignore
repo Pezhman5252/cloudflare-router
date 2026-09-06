@@ -7,6 +7,6 @@ node_modules/
 # آثار موقت ابزارها و تست‌ها — هرگز commit نشوند
 .npm-cache/
 .tmp-sql-probe/
-tests/.tmp-v4-core.mjs
+tests/.tmp-v5-core.mjs
 body.json
 body-stream.json

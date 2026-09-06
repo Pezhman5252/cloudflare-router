@@ -1,74 +1,73 @@
-# Cloudflare Router v4 (فیکس‌شده)
+# Cloudflare Router v5
 
-Router روی Cloudflare Workers برای Providerهای سازگار با OpenAI، با هماهنگی کلید روی Durable Object و SQLite.
+روتر Cloudflare Workers برای Providerهای سازگار با OpenAI، با Service Binding، Durable Object و SQLite.
 
-## وضعیت این نسخه
+> **Release status:** Release Candidate. قبل از انتشار عمومی، تست واقعی Cloudflare staging و `npm run check` باید سبز باشند.
 
-این پروژه از نسخه‌ی قبلی با رفع باگ‌های بحرانی زیر به دست آمده است (همه با تست اجرایی اثبات شده‌اند):
-
-| # | مشکل قبلی | رفع اعمال‌شده |
-|---|-----------|---------------|
-| ۱ | هر درخواست استریم SSE با `Invalid state: The ReadableStream is locked` شکست می‌خورد و همه‌ی کلیدها خرج می‌شدند (double-pipe روی `resp.body`) | استریم اکنون **تک‌لوله‌ای** است: `upstream → TransformStream` یک‌بار pipe می‌شود و `readable` به کلاینت داده می‌شود؛ usage از رویدادهای `data:` حین عبور استخراج و در پایان استریم ثبت می‌شود |
-| ۲ | failover روی POST کاملاً مرده بود (`request.body` فقط یک‌بار قابل خواندن است) | بدنه یک‌بار و **قبل از حلقه** با `arrayBuffer()` بافر می‌شود و هر تلاش از کپی تازه استفاده می‌کند |
-| ۳ | راوتر با `workers_dev=false` و بدون هیچ route عملاً غیرقابل دسترس بود | `workers_dev=true` در `router/wrangler.toml` (کلید گیت‌وی دسترسی را کنترل می‌کند) |
-| ۴ | کلیدی که 401 می‌گرفت برای همیشه `invalid` می‌شد (کلید اشتباه وارد شده یا تعویض موقت، ظرفیت را برای همیشه می‌بست) | 401 فقط یک **قرنطینه‌ی موقت** (`AUTH_COOLDOWN_MS`، پیش‌فرض ۱۵ دقیقه) است؛ پس از آن کلید خودبه‌خود برای درخواست‌های جدید بازیابی می‌شود |
-| ۵ | `redirect:"manual"` هدر `Location` و بدنه‌ی redirect را به کلاینت لو می‌داد | `redirect:"follow"` — کلیدها بدون افشای مقصد دنبال می‌شوند |
-| ۶ | هدر `authorization` همیشه Bearer بود (کلیدهای x-api-key مثل برخی Providerها کار نمی‌کردند) | متغیر `AUTH_MODE` (`bearer` پیش‌فرض / `x-api-key`) در wrangler.toml هر provider |
-| ۷ | کلید تکراری در حلقه → خطای مبهم و لو رفتن inflight | تشخیص «کلید دیگری نیست»: خطای **قطعی** (401/403/429) → پاس واقعی upstream به کلاینت؛ خطای **گذرا** (5xx/شبکه) → retry مشروع با همان کلید |
-| ۸ | 400/404 و خطاهای client دیگر کلید را جریمه می‌کردند | خطاهای client (`4xx` غیر از 401/403/408/425/429) passthrough فوری و بدون جریمه‌ی کلید هستند |
-| ۹ | در اجرای واقعی Cloudflare، اولین درخواست با `this.sql.exec.rows is not iterable` شکست می‌خورد — shim تست، API واقعی SQL را درست شبیه‌سازی نکرده بود (cursor واقعی `.rows` ندارد، سطر پیش‌فرض آن آبجکت است و `BEGIN/COMMIT` از طریق `exec()` ممنوع است) | همه‌ی خواندن‌های موقعیتی به `cursor.raw()` (سطر = آرایه) منتقل شد؛ `BEGIN/COMMIT/ROLLBACK` حذف شد (نوشتن‌های متوالی بدون await خودکار اتمیک‌اند)؛ shim تست اکنون قرارداد واقعی `SqlStorageCursor` را شبیه‌سازی می‌کند |
-
-## Architecture
+## معماری
 
 ```text
-Client → Master Router → Service Binding → Provider Worker → Durable Object (SQLite) → Upstream API
+Client
+  │
+  ▼
+Master Router
+  │  auth / route / request-id
+  ▼
+Service Binding
+  │
+  ▼
+Provider Worker
+  │
+  ├── bounded retry / failover
+  ├── SSE streaming + usage extraction
+  └── Durable Object
+        └── SQLite
+             ├── key state
+             ├── daily/monthly/lifetime usage
+             ├── health / latency
+             ├── cooldown / Retry-After
+             ├── circuit breaker
+             └── inflight reservations
+  │
+  ▼
+Upstream API
 ```
 
-هر provider یک Durable Object با SQLite برای هماهنگی با سازگاری قوی (strong consistency) دارد:
+## Routing و reliability
 
-- رزرو اتمیک کلید و ردیابی in-flight
-- حسابداری توکن total/input/output (JSON و SSE)
-- انتخاب کم‌مصرف‌ترین کلید با توجه به همروندی (inflight × 200 در امتیاز)
-- cooldown برای 429 با پشتیبانی از `Retry-After` (فرم ثانیه و HTTP-date)
-- قرنطینه‌ی موقت 401 و 403 با بازیابی خودکار
-- degradation گذرا برای 408/425/5xx/timeout/خطای شبکه (پیش‌فرض ۵ ثانیه)
-- EMA تأخیر و شمارنده‌های سلامت
-- failover محدود‌شده در سطح provider
+نسخه V5 این سیاست‌ها را پیاده می‌کند:
 
-Router اصلی **عمداً retry نمی‌کند** تا دو لایه‌ی retry، درخواست‌های قابل‌حساب AI را ضرب‌دری نکنند. فقط لایه‌ی provider failover دارد (`MAX_ATTEMPTS=4`).
-
-## فایل‌ها
-
-```text
-cloudflare-router/
-├── README.md
-├── package.json
-├── .gitignore
-├── RELEASE_CHECKLIST.md
-├── common/
-│   └── provider-core.js        ← هسته‌ی مشترک: DO + حلقه‌ی failover
-├── router/
-│   ├── wrangler.toml
-│   └── src/index.js
-├── providers/
-│   ├── bai/
-│   │   ├── wrangler.toml
-│   │   └── src/index.js
-│   └── dahl/
-│       ├── wrangler.toml
-│       └── src/index.js
-└── tests/
-    └── v4-verify.mjs           ← ۴۵ تست با DO واقعی + SQLite واقعی
-```
+- انتخاب کلید بر اساس مصرف روزانه/ماهانه، lifetime usage، inflight، latency و failure history.
+- quota-aware routing با `DAILY_TOKEN_LIMIT` و `MONTHLY_TOKEN_LIMIT`.
+- `unknown usage` هرگز به‌عنوان مصرف صفرِ شناخته‌شده ثبت نمی‌شود.
+- شناسه‌ی کلیدها SHA-256 است؛ خود secret هیچ‌وقت در state ذخیره نمی‌شود.
+- 401/403/429 کلید را quarantine می‌کنند و روی کلید دیگری failover می‌شود.
+- `Retry-After` به‌صورت ثانیه یا HTTP-date خوانده و روی همان key اعمال می‌شود؛ request برای امتحان کردن key دیگر بی‌دلیل نمی‌خوابد.
+- خطاهای 408/425/5xx و network/timeout به‌صورت transient مدیریت می‌شوند.
+- circuit breaker شامل `healthy → degraded → open → half_open → healthy` است.
+- برای HALF_OPEN فقط یک probe هم‌زمان مجاز است.
+- retry دارای سقف attempt، backoff و total retry time است.
+- Master Router عمداً retry نمی‌کند تا retry ضربدری ایجاد نشود.
+- POST/PUT/PATCH قبل از failover یک‌بار buffer می‌شوند و هر attempt body مستقل دارد.
+- فقط SSE موفق وارد streaming می‌شود؛ SSE با status خطا وارد failover عادی می‌شود.
+- SSE usage حتی وقتی JSON در چند chunk تقسیم شده باشد استخراج می‌شود.
+- `inflight` در release/cancel آزاد می‌شود و در خطاهای داخلی نیز مسیر cleanup دارد.
 
 ## نصب
 
+نیازمند Node.js 22+ است.
+
 ```bash
-npm install
+npm ci
+```
+
+سپس:
+
+```bash
 npx wrangler login
 ```
 
-تنظیم secrets:
+Secretها:
 
 ```bash
 npx wrangler secret put ROUTER_API_KEY -c router/wrangler.toml
@@ -76,97 +75,71 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
 npx wrangler secret put UPSTREAM_API_KEYS -c providers/dahl/wrangler.toml
 ```
 
-`UPSTREAM_API_KEYS` لیست جدا‌شده با کاما است:
+## تست
 
-```text
-key1,key2,key3
-```
-
-هرگز secrets را commit نکنید.
-
-## Deploy
-
-اول providerها، بعد راوتر:
+تست مستقل Node + SQLite:
 
 ```bash
-npm run deploy:providers
-npm run deploy:router
+npm test
 ```
 
-یا:
+تست syntax و configuration:
 
 ```bash
-npm run deploy
+npm run test:all
 ```
 
-## مسیرها
-
-```text
-/a/... → https://api.b.ai/v1/...
-/b/... → https://inference.dahl.global/v1/...
-```
-
-نمونه:
-
-```text
-https://omniroute-master-proxy.<subdomain>.workers.dev/a/chat/completions
-https://omniroute-master-proxy.<subdomain>.workers.dev/b/chat/completions
-```
-
-## ویژگی‌های امنیتی
-
-- کلیدهای Provider فقط Worker Secret می‌مانند.
-- Durable Object فقط ID هش‌شده‌ی کلیدها را ذخیره می‌کند (هرگز خودِ کلید را).
-- Providerها از طریق `workers_dev` و `preview_urls` عمومی نیستند.
-- اعتبارنامه‌ی راوتر قبل از فوروارد حذف می‌شود.
-- هدرهای شناساگر شبکه‌ی کلاینت حذف می‌شوند.
-- پاسخ‌ها `no-store` هستند.
-- محدودیت اندازه‌ی بدنه: ۲۵ MiB پیش‌فرض (`MAX_BODY_BYTES`).
-- برای انتشار عمومی، WAF/rate limiting کلودفلر را جلوی راوتر فعال کنید.
-
-## چرخه‌ی عمر کلید
-
-| وضعیت | محرک | cooldown پیش‌فرض | بازیابی |
-|--------|------|------------------|----------|
-| `healthy` | 2xx/3xx/خطای client | — | — |
-| `rate_limited` | 429 | ۳۰ ثانیه یا `Retry-After` (سقف ۶۰ ثانیه) | خودکار پس از cooldown |
-| `invalid` | 401 | ۱۵ دقیقه | خودکار پس از cooldown (مسدودی دائمی وجود ندارد) |
-| `degraded` | 403، 408/425/5xx، timeout، خطای شبکه | ۵ ثانیه (403: ۱۵ دقیقه) | خودکار پس از cooldown |
-
-رفتار حلقه‌ی failover در هر درخواست:
-
-- تلاش ۱: بهترین کلید سالم
-- 401/403/429 → کلید بعدی (کلید فعلی exclude می‌شود)
-- 5xx/timeout/خطای شبکه → اول کلید سالم دیگر؛ اگر نبود، retry با همان کلید (چون مقصر کلید نیست)
-- خطای client (400/404/…) → passthrough فوری، بدون جریمه و بدون retry
-- اتمام تلاش‌ها → آخرین پاس واقعی upstream (یا `502 upstream_unavailable` فقط برای خطای شبکه)
-
-## Streaming
-
-SSE با تک‌لوله‌ای کردن (`pipeTo` یک‌بار) پاس داده می‌شود؛ فیلدهای usage در رویدادهای `data:` حین عبور استخراج و پس از اتمام استریم ثبت می‌شوند. اگر upstream usage ندهد، صفر ثبت می‌شود نه مقدار جعلی. قطع اتصال کلاینت رزرو را آزاد می‌کند (inflight لو نمی‌رود).
-
-## اعتبارسنجی اجرایی (اثبات)
-
-```bash
-node tests/v4-verify.mjs
-```
-
-۴۵ تست روی **کد واقعی** `provider-core.js` با **SQLite واقعی** (node:sqlite) و شبیه‌سازی دقیق قرارداد واقعی `SqlStorageCursor` مربوط به Durable Object (cursor مستقیم‌یتِرریت، سطر پیش‌فرض آبجکت، `raw()` برای سطر آرایه‌ای، و ممنوعیت BEGIN/COMMIT مثل runtime واقعی) اجرا می‌شود و پوشش می‌دهد: SSE سالم + استخراج usage، failover POST با 401، قرنطینه و بازیابی 401، failover 429، retry همان‌کلید روی 5xx، خطای شبکه ×۴، `AUTH_MODE=x-api-key`، اتمام کلیدها، passthrough 400، و رفتار راوتر (health/404/401/حذف کلید کلاینت).
-
-برای بررسی باندل wrangler:
+اعتبارسنجی واقعی Wrangler:
 
 ```bash
 npm run check
 ```
 
-## محدودیت‌های صادقانه
+Cloudflare برای تست Durable Objects استفاده از Workers Vitest integration را توصیه می‌کند؛ این repository علاوه بر suite محلی، `npm run check` را نیز به‌عنوان gate انتشار نگه می‌دارد. urlCloudflare Durable Objects testing documentationhttps://developers.cloudflare.com/durable-objects/examples/testing-with-durable-objects/
 
-- این تست‌ها رفتار هسته را روی Node با شبیه‌سازی `cloudflare:workers` و قرارداد واقعی SQL اثبات می‌کنند؛ قرار دادن در staging واقعی (همان کد با wrangler dev یا deploy آزمایشی) قبل از تکیه‌ی کامل ضروری است — به‌خصوص قراردادهای دقیق احراز هویت و مدل‌های BAI/Dahl. (باگ شماره‌ی ۹ جدول بالا دقیقاً در اجرای واقعی کشف شد، نه در تست.)
-- در Windows هنگام اجرای تست، هشدار آزمایشی بودن `node:sqlite` طبیعی است.
-- اجرای Durable Object هزینه‌ی جزئی requests/duration دارد؛ با تعداد کلیدهای کم ناچیز است.
-- اگر upstream در پاسخ JSON usage ندهد و هدر `x-token-usage` هم نداشته باشد، مصرف صفر ثبت می‌شود.
-- تایم‌اوت با `AbortController` پیاده شده؛ در service binding های درون‌workerd پشتیبانی سیگنال ممکن است کامل نباشد (تایم‌اوت روی fetch مستقیم provider→upstream اعمال می‌شود).
+## Configuration مهم
 
-## توصیه‌ی تولید
+Providerها:
 
-Wrangler را روی نسخه‌ی آزموده pin کنید، staging/production را جدا نگه دارید، کلیدها را دوره‌ای بچرخانید، WAF/rate limiting را فعال کنید و توزیع وضعیت/خطا/تأخیر upstream را پایش کنید.
+| متغیر | پیش‌فرض | توضیح |
+|---|---:|---|
+| `MAX_ATTEMPTS` | `4` | حداکثر attempt برای هر request |
+| `MAX_RETRY_TIME_MS` | `15000` | سقف زمانی retry |
+| `MAX_BACKOFF_MS` | `60000` | سقف backoff تصادفی |
+| `MAX_COOLDOWN_MS` | `900000` | سقف quarantine/cooldown |
+| `UPSTREAM_TIMEOUT_MS` | `25000` | timeout هر upstream attempt |
+| `MAX_BODY_BYTES` | `10485760` | سقف body ورودی |
+| `DAILY_TOKEN_LIMIT` | `0` | صفر یعنی بدون سقف |
+| `MONTHLY_TOKEN_LIMIT` | `0` | صفر یعنی بدون سقف |
+| `AUTH_COOLDOWN_MS` | `900000` | quarantine بعد از 401 |
+| `FORBIDDEN_COOLDOWN_MS` | `900000` | quarantine بعد از 403 |
+| `RATE_COOLDOWN_MS` | `30000` | حداقل cooldown برای 429 |
+| `TRANSIENT_COOLDOWN_MS` | `5000` | cooldown خطای transient |
+
+## انتشار
+
+قبل از Public Release باید این‌ها سبز باشند:
+
+```bash
+npm ci
+npm run test:all
+npm run check
+```
+
+سپس ابتدا staging واقعی Cloudflare را تست کنید و بعد:
+
+```bash
+npm run deploy
+```
+
+جزئیات gate انتشار در `RELEASE_CHECKLIST.md` است.
+
+
+## API key configuration (V5.0.4)
+
+`UPSTREAM_API_KEYS` accepts the legacy comma-separated format, semicolon/newline-separated values, or a JSON array. Use the JSON-array form when a provider key itself can contain commas, for example `[`"`key,with,commas`"`]`. The provider worker enforces the configured body limit incrementally and buffers only up to that limit because request replay is required for failover retries.
+
+
+### Request body handling (V5.0.4)
+
+The router performs an early `Content-Length` rejection but does not buffer request bodies. Chunked/streamed bodies are forwarded directly through the Service Binding. The provider is the authoritative bounded replay boundary: it incrementally reads and buffers only up to `MAX_BODY_BYTES`, returning HTTP 413 when the limit is exceeded. This avoids buffering the same request body twice while preserving retry/failover replay.

@@ -1,194 +1,451 @@
 import { DurableObject } from "cloudflare:workers";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OmniRoute Provider Core (v4 — fixed)
-//
-// هسته‌ی مشترک هر دو Provider Worker:
-//   - Durable Object (SQLite) برای هماهنگی کلیدها: رزرو اتمیک، inflight، آمار
-//   - failover بین کلیدها روی 401/403/429/408/425/5xx/تایم‌اوت/خطای شبکه
-//   - مدیریت صحیح استریم SSE (تک‌لوله‌ای) با استخراج usage از رویدادهای data:
-//
-// سه نکته‌ی حیاتی پیاده‌سازی (در نسخه‌های قبلی باگ بحرانی بودند):
-//   ۱) بدنه‌ی درخواست یک‌بار و قبل از حلقه‌ی failover بافر می‌شود؛ استریم body
-//      فقط یک‌بار قابل خواندن است و بدون این بافر، تلاش دوم با
-//      «body disturbed» شکست می‌خورد و failover روی POST عملاً مرده است.
-//   ۲) پاسخ SSE فقط یک‌بار pipe می‌شود: upstream → transform.writable (pump)
-//      و transform.readable به کلاینت داده می‌شود. pipe کردن دوباره‌ی
-//      resp.body استریم را قفل می‌کند و هر درخواست استریم را ۵۰۲ می‌کند.
-//   ۳) API واقعی SQL در Durable Object: exec() یک SqlStorageCursor برمی‌گرداند
-//      که مستقیماً iterable است و خاصیت .rows ندارد؛ سطر پیش‌فرض cursor آبجکت
-//      است (کلید = نام ستون) و خواندن موقعیتی (سطر = آرایه) فقط از raw() است.
-//      ضمناً BEGIN/COMMIT/ROLLBACK از طریق exec() در runtime واقعی Cloudflare
-//      ممنوع است و خطا می‌دهد — نوشتن‌های متوالی بدون await اتمیک‌اند. این
-//      ناسازگاری فقط در اجرای واقعی Cloudflare آشکار شد.
-// ─────────────────────────────────────────────────────────────────────────────
+const DEFAULTS = {
+  timeout: 25000,
+  maxAttempts: 4,
+  backoff: 350,
+  maxBackoff: 60000,
+  maxRetryTime: 15000,
+  maxBodyBytes: 10 * 1024 * 1024,
+  authCooldown: 900000,
+  forbiddenCooldown: 900000,
+  rateCooldown: 30000,
+  transientCooldown: 5000,
+  maxCooldown: 15 * 60 * 1000,
+  dailyTokenLimit: 0,
+  monthlyTokenLimit: 0,
+};
 
-// ---- توابع کمکی ----
+const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const AUTH_FAILURE_STATUSES = new Set([401, 403]);
 
-function id(key) {
-  let hash = 2166136261;
-  for (let i = 0; i < key.length; i++) {
-    hash ^= key.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
+function parseKeys(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return [];
+
+  // Preferred format: JSON array, which safely supports keys containing commas.
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return [...new Set(parsed.map(v => String(v).trim()).filter(Boolean))];
+      }
+    } catch {}
   }
-  return "k_" + (hash >>> 0).toString(16);
+
+  // Recommended human-readable format is one key per line or semicolon-separated.
+  // Keep comma parsing as a backward-compatible fallback for existing deployments.
+  const delimiter = raw.includes("\n") || raw.includes(";") ? /[;\n]+/ : /,/;
+  return [...new Set(raw.split(delimiter).map(s => s.trim()).filter(Boolean))];
 }
 
-function parse(val) {
-  return String(val || "").split(",").map(s => s.trim()).filter(Boolean);
+async function keyId(key) {
+  const bytes = new TextEncoder().encode(key);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+  return `k_${hex}`;
 }
 
-function find(val, kid) {
-  return parse(val).find(k => id(k) === kid) || "";
+async function keyMap(value) {
+  const map = new Map();
+  for (const key of parseKeys(value)) map.set(await keyId(key), key);
+  return map;
 }
 
 function validId(v) {
   return !!v && /^[A-Za-z0-9._:=+@-]{1,128}$/.test(v);
 }
 
-function getRetryAfter(resp) {
-  const val = resp.headers.get("retry-after");
-  if (!val) return null;
-  const num = Number(val);
-  if (Number.isFinite(num)) return Math.max(0, num * 1000);
-  const date = Date.parse(val);
-  if (Number.isFinite(date)) return Math.max(0, date - Date.now());
-  return null;
-}
-
-function calculateWait(resp, attempt, backoff, maxBackoff) {
-  const retryAfterMs = getRetryAfter(resp);
-  if (retryAfterMs !== null && retryAfterMs > 0) {
-    return Math.min(maxBackoff, retryAfterMs);
-  }
-  return Math.min(maxBackoff, backoff * 2 ** attempt + Math.random() * 250);
+function getRetryAfter(response) {
+  const value = response.headers.get("retry-after");
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
 }
 
 function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function log(level, message, ...args) {
   const prefix = `[${new Date().toISOString()}] [${level.toUpperCase()}]`;
-  console[level === "error" ? "error" : "log"](prefix, message, ...args);
+  (level === "error" ? console.error : console.log)(prefix, message, ...args);
 }
 
-// ---- Durable Object ----
+function cfgNumber(env, name, fallback, minimum = 0) {
+  const n = Number(env?.[name]);
+  return Number.isFinite(n) && n >= minimum ? n : fallback;
+}
+
+function runtimeConfig(env, custom = {}) {
+  return {
+    timeout: cfgNumber(env, "UPSTREAM_TIMEOUT_MS", custom.timeout ?? DEFAULTS.timeout, 1),
+    maxAttempts: Math.max(1, Math.floor(cfgNumber(env, "MAX_ATTEMPTS", custom.maxAttempts ?? DEFAULTS.maxAttempts, 1))),
+    backoff: cfgNumber(env, "BACKOFF_MS", custom.backoff ?? DEFAULTS.backoff),
+    maxBackoff: cfgNumber(env, "MAX_BACKOFF_MS", custom.maxBackoff ?? DEFAULTS.maxBackoff),
+    maxRetryTime: cfgNumber(env, "MAX_RETRY_TIME_MS", custom.maxRetryTime ?? DEFAULTS.maxRetryTime),
+    maxBodyBytes: cfgNumber(env, "MAX_BODY_BYTES", custom.maxBodyBytes ?? DEFAULTS.maxBodyBytes, 1),
+    authCooldown: cfgNumber(env, "AUTH_COOLDOWN_MS", custom.authCooldown ?? DEFAULTS.authCooldown),
+    forbiddenCooldown: cfgNumber(env, "FORBIDDEN_COOLDOWN_MS", custom.forbiddenCooldown ?? DEFAULTS.forbiddenCooldown),
+    rateCooldown: cfgNumber(env, "RATE_COOLDOWN_MS", custom.rateCooldown ?? DEFAULTS.rateCooldown),
+    transientCooldown: cfgNumber(env, "TRANSIENT_COOLDOWN_MS", custom.transientCooldown ?? DEFAULTS.transientCooldown),
+    maxCooldown: cfgNumber(env, "MAX_COOLDOWN_MS", custom.maxCooldown ?? DEFAULTS.maxCooldown),
+    dailyTokenLimit: cfgNumber(env, "DAILY_TOKEN_LIMIT", custom.dailyTokenLimit ?? DEFAULTS.dailyTokenLimit),
+    monthlyTokenLimit: cfgNumber(env, "MONTHLY_TOKEN_LIMIT", custom.monthlyTokenLimit ?? DEFAULTS.monthlyTokenLimit),
+  };
+}
+
+function dayStart(ts) {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+function monthStart(ts) {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+}
+
+function isSuccessfulStatus(status) {
+  return status >= 200 && status < 400;
+}
+
+function isRetryable(status) {
+  return RETRYABLE_STATUSES.has(status) || AUTH_FAILURE_STATUSES.has(status);
+}
+
+function isTransient(status) {
+  return status === 0 || status === 408 || status === 425 || (status >= 500 && status <= 599);
+}
+
+function isStreamResponse(response) {
+  return (response.headers.get("content-type") || "").toLowerCase().includes("text/event-stream");
+}
+
+function responseHeaders(response, reqId) {
+  const headers = new Headers(response.headers);
+  headers.set("x-request-id", reqId);
+  headers.set("cache-control", "no-store");
+  return headers;
+}
+
+function finalizeResponse(response, reqId) {
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders(response, reqId),
+  });
+}
+
+function errorResponse(message, status, reqId, extra = {}) {
+  return Response.json({ error: message, ...(reqId ? { request_id: reqId } : {}) }, {
+    status,
+    headers: { "cache-control": "no-store", ...(reqId ? { "x-request-id": reqId } : {}), ...extra },
+  });
+}
+
+function normalizeUsage(usage, fallbackTotal = null) {
+  if (!usage || typeof usage !== "object") return null;
+  const input = Number(usage.input_tokens ?? usage.prompt_tokens);
+  const output = Number(usage.output_tokens ?? usage.completion_tokens);
+  const total = Number(usage.total_tokens ?? fallbackTotal ?? ((Number.isFinite(input) ? input : 0) + (Number.isFinite(output) ? output : 0)));
+  const hasAny = [input, output, total].some(Number.isFinite);
+  if (!hasAny) return null;
+  return {
+    input_tokens: Number.isFinite(input) ? Math.max(0, input) : 0,
+    output_tokens: Number.isFinite(output) ? Math.max(0, output) : 0,
+    total_tokens: Number.isFinite(total) ? Math.max(0, total) : 0,
+  };
+}
+
+async function extractUsage(response) {
+  try {
+    const data = await response.clone().json();
+    const usage = normalizeUsage(data?.usage ?? data?.token_usage, data?.total_tokens);
+    if (usage) return usage;
+  } catch {}
+
+  const headerValue = response.headers.get("x-token-usage");
+  const headerTotal = Number(headerValue);
+  if (headerValue !== null && headerValue !== "" && Number.isFinite(headerTotal) && headerTotal >= 0) {
+    return { input_tokens: 0, output_tokens: 0, total_tokens: headerTotal };
+  }
+  return null;
+}
+
+function parseSseLine(line) {
+  if (!line.startsWith("data:")) return null;
+  const payload = line.slice(5).trimStart();
+  if (!payload || payload === "[DONE]") return null;
+  try {
+    const json = JSON.parse(payload);
+    return normalizeUsage(json?.usage ?? json?.response?.usage, json?.total_tokens);
+  } catch {
+    return null;
+  }
+}
+
+function mergeUsage(current, next) {
+  if (!next) return current;
+  return {
+    input_tokens: (current?.input_tokens ?? 0) + (next.input_tokens ?? 0),
+    output_tokens: (current?.output_tokens ?? 0) + (next.output_tokens ?? 0),
+    total_tokens: (current?.total_tokens ?? 0) + (next.total_tokens ?? 0),
+  };
+}
+
+function fullJitterDelay(base, attempt, max) {
+  const cap = Math.min(max, base * (2 ** attempt));
+  return Math.floor(Math.random() * (cap + 1));
+}
+
+function calculateRetryDelay(response, attempt, config, startedAt) {
+  const retryAfter = getRetryAfter(response);
+  const remaining = Math.max(0, config.maxRetryTime - (Date.now() - startedAt));
+  if (remaining <= 0) return 0;
+  const delay = retryAfter == null ? fullJitterDelay(config.backoff, attempt, config.maxBackoff) : Math.min(retryAfter, config.maxBackoff);
+  return Math.min(delay, remaining);
+}
+
+function nextUtcMidnight(ts) {
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) + 1000;
+}
 
 export class ApiKeyCoordinator extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS keys (
-        id TEXT PRIMARY KEY,
-        total INTEGER NOT NULL DEFAULT 0,
-        input INTEGER NOT NULL DEFAULT 0,
-        output INTEGER NOT NULL DEFAULT 0,
-        requests INTEGER NOT NULL DEFAULT 0,
-        success INTEGER NOT NULL DEFAULT 0,
-        errors INTEGER NOT NULL DEFAULT 0,
-        rate429 INTEGER NOT NULL DEFAULT 0,
-        failures INTEGER NOT NULL DEFAULT 0,
-        latency REAL NOT NULL DEFAULT 500,
-        state TEXT NOT NULL DEFAULT 'healthy',
-        cooldown INTEGER NOT NULL DEFAULT 0,
-        inflight INTEGER NOT NULL DEFAULT 0,
-        last_used INTEGER NOT NULL DEFAULT 0,
-        last_success INTEGER NOT NULL DEFAULT 0,
-        last_failure INTEGER NOT NULL DEFAULT 0
-      )
-    `);
-  }
-
-  async fetch(req) {
-    const action = new URL(req.url).pathname.slice(1);
-    if (action === "select") return this.select(await req.json().catch(() => ({})));
-    if (action === "release") return this.release(await req.json());
-    if (action === "cancel") return this.cancel(await req.json());
-    if (action === "stats") return this.stats();
-    return Response.json({ error: "unknown_coordinator_action" }, { status: 404 });
-  }
-
-  // کلیدهای جدید را اضافه و حذف‌شده‌ها را پاک می‌کند
-  async sync() {
-    const keys = parse(this.env.UPSTREAM_API_KEYS);
-    const allowed = new Set(keys.map(id));
-    for (const k of keys) {
-      this.sql.exec("INSERT OR IGNORE INTO keys(id) VALUES(?)", id(k));
-    }
-    // cursor پیش از هر DELETE کاملاً مصرف می‌شود (حذف سطر حین پیمایش cursor ایمن نیست)
-    const existing = [...this.sql.exec("SELECT id FROM keys").raw()].map(r => r[0]);
-    for (const kid of existing) {
-      if (!allowed.has(kid)) {
-        this.sql.exec("DELETE FROM keys WHERE id=?", kid);
+    ctx.blockConcurrencyWhile(async () => {
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS keys (
+          id TEXT PRIMARY KEY,
+          total INTEGER NOT NULL DEFAULT 0,
+          input INTEGER NOT NULL DEFAULT 0,
+          output INTEGER NOT NULL DEFAULT 0,
+          requests INTEGER NOT NULL DEFAULT 0,
+          success INTEGER NOT NULL DEFAULT 0,
+          errors INTEGER NOT NULL DEFAULT 0,
+          rate429 INTEGER NOT NULL DEFAULT 0,
+          auth401 INTEGER NOT NULL DEFAULT 0,
+          auth403 INTEGER NOT NULL DEFAULT 0,
+          timeouts INTEGER NOT NULL DEFAULT 0,
+          network_errors INTEGER NOT NULL DEFAULT 0,
+          transient5xx INTEGER NOT NULL DEFAULT 0,
+          failures INTEGER NOT NULL DEFAULT 0,
+          consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          latency REAL NOT NULL DEFAULT 500,
+          state TEXT NOT NULL DEFAULT 'healthy',
+          cooldown INTEGER NOT NULL DEFAULT 0,
+          inflight INTEGER NOT NULL DEFAULT 0,
+          half_open_probe INTEGER NOT NULL DEFAULT 0,
+          last_used INTEGER NOT NULL DEFAULT 0,
+          last_success INTEGER NOT NULL DEFAULT 0,
+          last_failure INTEGER NOT NULL DEFAULT 0,
+          day_start INTEGER NOT NULL DEFAULT 0,
+          day_tokens INTEGER NOT NULL DEFAULT 0,
+          day_requests INTEGER NOT NULL DEFAULT 0,
+          day_known_requests INTEGER NOT NULL DEFAULT 0,
+          month_start INTEGER NOT NULL DEFAULT 0,
+          month_tokens INTEGER NOT NULL DEFAULT 0,
+          month_requests INTEGER NOT NULL DEFAULT 0,
+          known_usage_requests INTEGER NOT NULL DEFAULT 0,
+          unknown_usage_requests INTEGER NOT NULL DEFAULT 0,
+          circuit_open_count INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS window_meta (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          day_start INTEGER NOT NULL,
+          month_start INTEGER NOT NULL
+        )
+      `);
+      const now = Date.now();
+      const currentDay = dayStart(now);
+      const currentMonth = monthStart(now);
+      this.sql.exec(
+        "INSERT OR IGNORE INTO window_meta(id, day_start, month_start) VALUES(1, ?, ?)",
+        currentDay,
+        currentMonth,
+      );
+      const existing = new Set([...this.sql.exec("PRAGMA table_info(keys)")].map(row => row.name));
+      const additions = {
+        auth401: "INTEGER NOT NULL DEFAULT 0",
+        auth403: "INTEGER NOT NULL DEFAULT 0",
+        timeouts: "INTEGER NOT NULL DEFAULT 0",
+        network_errors: "INTEGER NOT NULL DEFAULT 0",
+        transient5xx: "INTEGER NOT NULL DEFAULT 0",
+        consecutive_failures: "INTEGER NOT NULL DEFAULT 0",
+        half_open_probe: "INTEGER NOT NULL DEFAULT 0",
+        day_start: "INTEGER NOT NULL DEFAULT 0",
+        day_tokens: "INTEGER NOT NULL DEFAULT 0",
+        day_requests: "INTEGER NOT NULL DEFAULT 0",
+        day_known_requests: "INTEGER NOT NULL DEFAULT 0",
+        month_start: "INTEGER NOT NULL DEFAULT 0",
+        month_tokens: "INTEGER NOT NULL DEFAULT 0",
+        month_requests: "INTEGER NOT NULL DEFAULT 0",
+        known_usage_requests: "INTEGER NOT NULL DEFAULT 0",
+        unknown_usage_requests: "INTEGER NOT NULL DEFAULT 0",
+        circuit_open_count: "INTEGER NOT NULL DEFAULT 0",
+      };
+      for (const [name, definition] of Object.entries(additions)) {
+        if (!existing.has(name)) this.sql.exec(`ALTER TABLE keys ADD COLUMN ${name} ${definition}`);
       }
+
+      // Small, targeted indexes for the coordinator's eligibility filters.
+      // We intentionally avoid one index per ORDER BY expression: those indexes
+      // would add write amplification without materially helping the scoring
+      // expressions.
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_state_cooldown ON keys(state, cooldown)`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_quota ON keys(day_tokens, month_tokens)`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_inflight_last_used ON keys(inflight, last_used)`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_keys_failures ON keys(consecutive_failures)`);
+
+      if (typeof ctx.storage.setAlarm === "function") {
+        await ctx.storage.setAlarm(nextUtcMidnight(Date.now()));
+      }
+    });
+  }
+
+  async alarm() {
+    const now = Date.now();
+    this.resetWindows(now);
+    if (typeof this.ctx?.storage?.setAlarm === "function") {
+      await this.ctx.storage.setAlarm(nextUtcMidnight(now));
     }
+  }
+
+  async fetch(request) {
+    const action = new URL(request.url).pathname.slice(1);
+    try {
+      if (action === "select") return this.select(await request.json().catch(() => ({})));
+      if (action === "release") return this.release(await request.json());
+      if (action === "cancel") return this.cancel(await request.json());
+      if (action === "stats") return this.stats();
+      return Response.json({ error: "unknown_coordinator_action" }, { status: 404 });
+    } catch (error) {
+      log("error", `Coordinator ${action} failed`, error?.stack || error);
+      return Response.json({ error: "coordinator_error" }, { status: 500 });
+    }
+  }
+
+  async sync() {
+    const keys = parseKeys(this.env.UPSTREAM_API_KEYS);
+    const allowed = new Set();
+    for (const key of keys) allowed.add(await keyId(key));
+    for (const kid of allowed) this.sql.exec("INSERT OR IGNORE INTO keys(id) VALUES(?)", kid);
+    const existing = [...this.sql.exec("SELECT id FROM keys").raw()].map(r => r[0]);
+    for (const kid of existing) if (!allowed.has(kid)) this.sql.exec("DELETE FROM keys WHERE id=? AND inflight=0", kid);
     return keys;
   }
 
-  /**
-   * انتخاب کلید (دو مرحله‌ای):
-   *  ۱) کلید سالمِ «متفاوت» از excludeها (failover واقعی)
-   *  ۲) اگر allow_degraded و هیچ کلید دیگری نبود: کلید degraded (حتی با
-   *     cooldown فعال) — برای retryهای 5xx/خطای شبکه با همان کلید.
-   *  زمان‌بندی فقط با cooldown کنترل می‌شود؛ کلید invalid (401) پس از پایان
-   *  AUTH_COOLDOWN_MS خودبه‌خود برای درخواست‌های جدید بازیابی می‌شود
-   *  (مسدودی دائمی وجود ندارد) و rate_limited پس از پایان cooldown آن.
-   */
-  async select(data = {}) {
-    await this.sync();
-    const now = Date.now();
-    const exclude = Array.isArray(data.exclude) ? data.exclude : [];
-    const allowDegraded = data.allow_degraded ? 1 : 0;
-
-    const ph = exclude.map(() => "?").join(",");
-    const excludedSql = exclude.length ? `AND id NOT IN (${ph})` : "";
-
-    // مرحله ۱: کلید متفاوت و سالم
-    let rows = [...this.sql.exec(`
-      SELECT id FROM keys
-      WHERE (cooldown = 0 OR cooldown <= ?)
-        ${excludedSql}
-      ORDER BY (total + inflight * 200) ASC,
-                failures ASC,
-                latency ASC,
-                last_used ASC
-      LIMIT 1
-    `, now, ...exclude).raw()];
-
-    // مرحله ۲: retry با کلید degraded همین درخواست (5xx/خطای شبکه)
-    if (!rows.length && allowDegraded) {
-      rows = [...this.sql.exec(`
-        SELECT id FROM keys
-        WHERE state = 'degraded'
-        ORDER BY (total + inflight * 200) ASC,
-                  failures ASC,
-                  latency ASC,
-                  last_used ASC
-        LIMIT 1
-      `).raw()];
+  resetWindows(now) {
+    const day = dayStart(now);
+    const month = monthStart(now);
+    const meta = [...this.sql.exec("SELECT day_start, month_start FROM window_meta WHERE id=1").raw()][0];
+    const oldDay = Number(meta?.[0] ?? 0);
+    const oldMonth = Number(meta?.[1] ?? 0);
+    if (oldDay !== day) {
+      this.sql.exec("UPDATE keys SET day_start=?, day_tokens=0, day_requests=0, day_known_requests=0", day);
     }
-
-    if (!rows.length) {
-      log("warn", "No healthy API key available");
-      return Response.json({ error: "no_healthy_api_key" }, { status: 503 });
+    if (oldMonth !== month) {
+      this.sql.exec("UPDATE keys SET month_start=?, month_tokens=0, month_requests=0", month);
     }
-    const kid = rows[0][0];
-    this.sql.exec(`
-      UPDATE keys
-      SET inflight = inflight + 1,
-          requests = requests + 1,
-          last_used = ?
-      WHERE id = ?
-    `, now, kid);
-    const apiKey = find(this.env.UPSTREAM_API_KEYS, kid);
-    return Response.json({ key_id: kid, api_key: apiKey });
+    if (oldDay !== day || oldMonth !== month) {
+      this.sql.exec("UPDATE window_meta SET day_start=?, month_start=? WHERE id=1", day, month);
+    }
   }
 
-  async release(data) {
+  async select(data = {}) {
+    const keys = await this.sync();
+    const map = new Map();
+    for (const key of keys) map.set(await keyId(key), key);
+    const now = Date.now();
+    this.resetWindows(now);
+    const day = dayStart(now);
+    const month = monthStart(now);
+    const config = runtimeConfig(this.env);
+    const exclude = Array.isArray(data.exclude) ? data.exclude.filter(validId) : [];
+    const allowDegraded = Boolean(data.allow_degraded);
+    const allowHalfOpen = Boolean(data.allow_half_open);
+    const placeholders = exclude.map(() => "?").join(",");
+    const excludedSql = exclude.length ? `AND id NOT IN (${placeholders})` : "";
+    const allowedIds = [...map.keys()];
+    const allowedPlaceholders = allowedIds.map(() => "?").join(",");
+    const allowedSql = allowedIds.length ? `AND id IN (${allowedPlaceholders})` : "AND 1=0";
+
+    // A key in cooldown is never selected for a new attempt, except when it is
+    // eligible for a single HALF_OPEN probe after cooldown expiry.
+    let rows = [...this.sql.exec(`
+      SELECT id, state, cooldown, inflight, day_tokens, month_tokens, day_requests,
+             consecutive_failures, latency, last_used, half_open_probe
+      FROM keys
+      WHERE (cooldown = 0 OR cooldown <= ?)
+        ${excludedSql}
+        ${allowedSql}
+        AND (? = 0 OR day_tokens < ?)
+        AND (? = 0 OR month_tokens < ?)
+        AND (
+          state = 'healthy'
+          OR (state = 'degraded' AND ? = 1)
+          OR (state = 'open' AND ? = 1)
+          OR state IN ('invalid','rate_limited')
+        )
+      ORDER BY
+        CASE WHEN state = 'healthy' THEN 0 ELSE 1 END ASC,
+        CASE WHEN ? > 0 THEN MIN(1.0, day_tokens * 1.0 / ?) ELSE 0 END ASC,
+        CASE WHEN ? > 0 THEN MIN(1.0, month_tokens * 1.0 / ?) ELSE 0 END ASC,
+        (inflight * 0.08) ASC,
+        (MIN(1.0, consecutive_failures / 5.0) * 0.20) ASC,
+        (MIN(1.0, latency / 10000.0) * 0.10) ASC,
+        last_used ASC
+      LIMIT 1
+    `, now, ...exclude, ...allowedIds,
+       config.dailyTokenLimit > 0 ? 1 : 0, config.dailyTokenLimit,
+       config.monthlyTokenLimit > 0 ? 1 : 0, config.monthlyTokenLimit,
+       allowDegraded ? 1 : 0, allowHalfOpen ? 1 : 0,
+       config.dailyTokenLimit, Math.max(1, config.dailyTokenLimit),
+       config.monthlyTokenLimit, Math.max(1, config.monthlyTokenLimit)).raw()];
+
+    if (!rows.length && allowDegraded && validId(data.retry_key) && map.has(data.retry_key)) {
+      rows = [...this.sql.exec(`
+        SELECT id, state, cooldown, inflight, day_tokens, month_tokens, day_requests,
+               consecutive_failures, latency, last_used, half_open_probe
+        FROM keys
+        WHERE id=? AND (cooldown=0 OR cooldown<=?)
+          AND (?=0 OR day_tokens<?) AND (?=0 OR month_tokens<?)
+          AND state IN ('degraded','open')
+        LIMIT 1
+      `, data.retry_key, now,
+         config.dailyTokenLimit > 0 ? 1 : 0, config.dailyTokenLimit,
+         config.monthlyTokenLimit > 0 ? 1 : 0, config.monthlyTokenLimit).raw()];
+    }
+    if (!rows.length) return Response.json({ error: "no_healthy_api_key" }, { status: 503 });
+
+    const [kid, state, cooldown, inflight, dayTokens, monthTokens, dayRequests, failures, latency, lastUsed, probe] = rows[0];
+    const isProbe = (state === "open" || state === "invalid" || state === "rate_limited") && cooldown <= now;
+    const isHalfOpen = isProbe && (state === "open" ? allowHalfOpen : true);
+    if (isHalfOpen && Number(probe) > 0) return Response.json({ error: "no_healthy_api_key" }, { status: 503 });
+
+    const nextState = isHalfOpen ? "half_open" : state;
+    this.sql.exec(`
+      UPDATE keys SET
+        inflight=inflight+1,
+        requests=requests+1,
+        last_used=?,
+        state=?,
+        half_open_probe=?
+      WHERE id=?
+    `, now, nextState, isHalfOpen ? 1 : 0, kid);
+
+    return Response.json({ key_id: kid, api_key: map.get(kid), day_start: day, month_start: month });
+  }
+
+  async release(data = {}) {
     const kid = String(data.key_id || "");
-    const row = [...this.sql.exec("SELECT latency, failures FROM keys WHERE id=?", kid).raw()][0];
+    const row = [...this.sql.exec(`SELECT latency, failures, consecutive_failures, state, cooldown, half_open_probe FROM keys WHERE id=?`, kid).raw()][0];
     if (!row) return Response.json({ error: "unknown_key_id" }, { status: 404 });
 
     const now = Date.now();
@@ -197,251 +454,172 @@ export class ApiKeyCoordinator extends DurableObject {
     const input = Math.max(0, Number(data.input_tokens || 0));
     const output = Math.max(0, Number(data.output_tokens || 0));
     const total = Math.max(0, Number(data.total_tokens || input + output));
-
-    const cfg = {
-      rateCooldown: Number(this.env.RATE_COOLDOWN_MS) || 30000,
-      authCooldown: Number(this.env.AUTH_COOLDOWN_MS) || 900000,
-      transientCooldown: Number(this.env.TRANSIENT_COOLDOWN_MS) || 5000,
-      maxBackoff: Number(this.env.MAX_BACKOFF_MS) || 60000,
-    };
-
+    const usageKnown = data.usage_known !== false && data.usage_known !== undefined ? Boolean(data.usage_known) : false;
+    const retryAfter = Number.isFinite(Number(data.retry_after_ms)) ? Math.max(0, Number(data.retry_after_ms)) : null;
+    const config = runtimeConfig(this.env);
+    const errorType = String(data.error_type || "");
+    const ok = isSuccessfulStatus(status);
+    const transient = isTransient(status);
+    const auth401 = status === 401;
+    const auth403 = status === 403;
+    const rate429 = status === 429;
     let state = "healthy";
     let cooldown = 0;
-    let incFailures = 0;
-    const isSuccess = status >= 200 && status < 300;
-    const isRedirect = status >= 300 && status < 400;
-    const isClientError = status >= 400 && status < 500;
-    // 3xx (مثلاً 304 با هدرهای شرطی، یا انتهای زنجیره‌ی redirect) پاسخ قابل‌قبول است؛
-    // شاخه‌ی redirect کلید را healthy اعلام می‌کند، پس حسابداری هم باید همین را بگوید.
-    const isOk = isSuccess || isRedirect;
+    let failures = Number(row[1]);
+    let consecutive = Number(row[2]);
+    let circuitOpenCount = 0;
+    let halfOpenProbe = 0;
 
-    if (status === 401) {
-      // کلید مشکوک به تعویض: قرنطینه‌ی موقت (نه مسدودی دائمی)
-      state = "invalid";
-      cooldown = now + cfg.authCooldown;
-      incFailures = 1;
-    } else if (status === 403) {
-      state = "degraded";
-      cooldown = now + cfg.authCooldown;
-      incFailures = 1;
-    } else if (status === 429) {
-      state = "rate_limited";
-      let retryAfterMs = Number(data.retry_after_ms || 0);
-      if (!retryAfterMs || retryAfterMs < cfg.rateCooldown) retryAfterMs = cfg.rateCooldown;
-      cooldown = now + Math.min(cfg.maxBackoff, retryAfterMs);
-      incFailures = 1;
-    } else if (status === 0 || (status >= 500 && status < 600) || [408, 425].includes(status)) {
-      state = "degraded";
-      cooldown = now + cfg.transientCooldown;
-      incFailures = 1;
-    } else if (isRedirect) {
+    if (ok) {
+      consecutive = 0;
       state = "healthy";
-      incFailures = 0;
-    } else if (isClientError) {
-      // 400/404/422 و…: تقصیر کلید نیست؛ آمار خطا ثبت ولی جریمه نمی‌شود
-      state = "healthy";
-      incFailures = 0;
-    } else if (!isSuccess) {
-      state = "degraded";
-      cooldown = now + cfg.transientCooldown;
-      incFailures = 1;
+    } else {
+      failures += 1;
+      consecutive += 1;
+      if (auth401) {
+        state = "invalid";
+        cooldown = now + config.authCooldown;
+      } else if (auth403) {
+        state = "degraded";
+        cooldown = now + config.forbiddenCooldown;
+      } else if (rate429) {
+        state = "rate_limited";
+        const wait = Math.min(config.maxCooldown, Math.max(config.rateCooldown, retryAfter ?? config.rateCooldown));
+        cooldown = now + wait;
+      } else if (transient) {
+        state = consecutive >= 3 ? "open" : "degraded";
+        cooldown = now + Math.min(config.maxCooldown, config.transientCooldown);
+        if (state === "open") circuitOpenCount = 1;
+      } else {
+        state = "healthy";
+      }
     }
 
-    // incFailures در هر شاخه‌ی بالا دقیقاً تعیین شده و منبع یگانه‌ی حقیقت است؛
-    // بازمحاسبه‌ی آن با شرط عمومی (مثل isClientError یا status=0) باگ بود:
-    // 401/403/429 جزو 4xx و خطای شبکه status=0 است و شمارش failures را دور می‌زد.
-    const failures = Number(row[1]) + incFailures;
+    if (String(row[3]) === "half_open" && ok) {
+      state = "healthy";
+      halfOpenProbe = 0;
+    }
+    if (state !== "open") halfOpenProbe = 0;
+
     const ema = Number(row[0]) * 0.8 + latency * 0.2;
-
-    // UPDATE تک‌statement است و چون تا پایانش هیچ await نیست، در DO اتمیک است؛
-    // ضمناً BEGIN/COMMIT از طریق sql.exec() در runtime واقعی Cloudflare ممنوع است.
+    const dStart = dayStart(now);
+    const mStart = monthStart(now);
     this.sql.exec(`
-        UPDATE keys SET
-          inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END,
-          total = total + ?,
-          input = input + ?,
-          output = output + ?,
-          success = success + ?,
-          errors = errors + ?,
-          rate429 = rate429 + ?,
-          failures = ?,
-          latency = ?,
-          state = ?,
-          cooldown = ?,
-          last_success = CASE WHEN ? THEN ? ELSE last_success END,
-          last_failure = CASE WHEN ? THEN ? ELSE last_failure END
-        WHERE id = ?
-      `,
-        total,
-        input,
-        output,
-        isOk ? 1 : 0,
-        isOk ? 0 : 1,
-        status === 429 ? 1 : 0,
-        failures,
-        ema,
-        state,
-        cooldown,
-        isOk ? 1 : 0,
-        now,
-        !isOk ? 1 : 0,
-        now,
-        kid
+      UPDATE keys SET
+        inflight=CASE WHEN inflight>0 THEN inflight-1 ELSE 0 END,
+        total=total+?, input=input+?, output=output+?,
+        success=success+?, errors=errors+?, rate429=rate429+?,
+        auth401=auth401+?, auth403=auth403+?,
+        timeouts=timeouts+?, network_errors=network_errors+?, transient5xx=transient5xx+?,
+        failures=?, consecutive_failures=?, latency=?, state=?, cooldown=?, half_open_probe=?,
+        last_success=CASE WHEN ? THEN ? ELSE last_success END,
+        last_failure=CASE WHEN ? THEN ? ELSE last_failure END,
+        day_start=?, day_tokens=day_tokens+?, day_requests=day_requests+1,
+        day_known_requests=day_known_requests+?,
+        month_start=?, month_tokens=month_tokens+?, month_requests=month_requests+1,
+        known_usage_requests=known_usage_requests+?,
+        unknown_usage_requests=unknown_usage_requests+?,
+        circuit_open_count=circuit_open_count+?
+      WHERE id=?
+    `,
+      total, input, output,
+      ok ? 1 : 0, ok ? 0 : 1, rate429 ? 1 : 0,
+      auth401 ? 1 : 0, auth403 ? 1 : 0,
+      (errorType === "timeout" || status === 408 || status === 425) ? 1 : 0,
+      (errorType === "network" || (status === 0 && errorType !== "timeout")) ? 1 : 0,
+      status >= 500 && status <= 599 ? 1 : 0,
+      failures, consecutive, ema, state, cooldown, halfOpenProbe,
+      ok ? 1 : 0, now, !ok ? 1 : 0, now,
+      dStart, usageKnown ? total : 0, usageKnown ? 1 : 0,
+      mStart, usageKnown ? total : 0,
+      usageKnown ? 1 : 0, usageKnown ? 0 : 1,
+      circuitOpenCount,
+      kid
     );
-
-    log("info", `Released key ${kid}, status ${status}, total ${total}`);
     return Response.json({ ok: true });
   }
 
-  // رزروی که مصرف نشد (مثلاً کلید تکراری انتخاب شد) — فقط inflight آزاد می‌شود
-  async cancel(data) {
+  async cancel(data = {}) {
     const kid = String(data.key_id || "");
-    this.sql.exec(`
-      UPDATE keys
-      SET inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END
-      WHERE id = ?
-    `, kid);
+    this.sql.exec(`UPDATE keys SET inflight=CASE WHEN inflight>0 THEN inflight-1 ELSE 0 END, half_open_probe=0 WHERE id=?`, kid);
     return Response.json({ ok: true });
   }
 
   async stats() {
     await this.sync();
     const rows = [...this.sql.exec(`
-      SELECT id, total, input, output, requests, success, errors, rate429,
-             failures, latency, state, cooldown, inflight,
-             last_used, last_success, last_failure
-      FROM keys ORDER BY total ASC
+      SELECT id,total,input,output,requests,success,errors,rate429,auth401,auth403,
+             timeouts,network_errors,transient5xx,failures,consecutive_failures,latency,state,
+             cooldown,inflight,half_open_probe,last_used,last_success,last_failure,
+             day_start,day_tokens,day_requests,day_known_requests,month_start,month_tokens,
+             month_requests,known_usage_requests,unknown_usage_requests,circuit_open_count
+      FROM keys ORDER BY day_tokens ASC, total ASC
     `).raw()];
     return Response.json({ keys: rows });
   }
 }
 
-// ---- توابع کمکی Worker ----
-
-async function upstream(req, url, key, reqId, attempt, timeout, bodyBuffer, authMode) {
-  const headers = new Headers(req.headers);
-  const removeHeaders = [
-    "authorization",
-    "x-api-key",
-    "x-auth-token",
-    "x-router-api-key",
-    "x-omniroute-provider",
-    "host",
-    "content-length",
-    "cf-connecting-ip",
-    "x-forwarded-for",
-    "x-real-ip"
-  ];
-  for (const h of removeHeaders) headers.delete(h);
-
-  // حالت احراز هویت upstream: Bearer (پیش‌فرض) یا x-api-key
-  if (authMode === "x-api-key") {
-    headers.set("x-api-key", key);
-  } else {
-    headers.set("authorization", `Bearer ${key}`);
+class BodyTooLargeError extends Error {
+  constructor(limit) {
+    super("request_body_too_large");
+    this.name = "BodyTooLargeError";
+    this.limit = limit;
   }
+}
+
+async function readBoundedBody(request, maxBytes) {
+  if (!request.body) return null;
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("body limit exceeded").catch(() => {});
+        throw new BodyTooLargeError(maxBytes);
+      }
+      chunks.push(chunk.slice());
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+async function upstream(request, url, key, reqId, attempt, timeout, bodyBuffer, authMode) {
+  const headers = new Headers(request.headers);
+  for (const header of [
+    "authorization", "x-api-key", "x-auth-token", "x-router-api-key", "x-omniroute-provider",
+    "host", "content-length", "cf-connecting-ip", "x-forwarded-for", "x-real-ip"
+  ]) headers.delete(header);
+  if (authMode === "x-api-key") headers.set("x-api-key", key);
+  else headers.set("authorization", `Bearer ${key}`);
   headers.set("x-request-id", reqId);
-  headers.set("x-provider-attempt", String(attempt));
+  headers.set("x-provider-attempt", String(attempt + 1));
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort(), timeout);
   try {
     return await fetch(new Request(url, {
-      method: req.method,
-      headers: headers,
-      // بدنه‌ی بافرشده در هر تلاش از کپی تازه ساخته می‌شود
+      method: request.method,
+      headers,
       body: bodyBuffer ? bodyBuffer.slice(0) : undefined,
       redirect: "follow",
-    }), { signal: controller.signal });
+      signal: controller.signal,
+    }));
   } finally {
-    clearTimeout(timeoutId);
+    clearTimeout(timer);
   }
-}
-
-async function extractUsage(resp) {
-  try {
-    const data = await resp.clone().json();
-    const u = data?.usage || data?.token_usage || {};
-    const input = Number(u.input_tokens ?? u.prompt_tokens ?? 0);
-    const output = Number(u.output_tokens ?? u.completion_tokens ?? 0);
-    const total = Number(u.total_tokens ?? data?.total_tokens ?? input + output);
-    return {
-      input_tokens: Number.isFinite(input) ? Math.max(0, input) : 0,
-      output_tokens: Number.isFinite(output) ? Math.max(0, output) : 0,
-      total_tokens: Number.isFinite(total) ? Math.max(0, total) : 0,
-    };
-  } catch {
-    const total = Number(resp.headers.get("x-token-usage") || 0);
-    return {
-      input_tokens: 0,
-      output_tokens: 0,
-      total_tokens: Number.isFinite(total) ? Math.max(0, total) : 0,
-    };
-  }
-}
-
-function streamResponse(resp, coord, keyId, start, reqId, waitUntil) {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let usage = null;
-  let released = false;
-  const retryAfter = getRetryAfter(resp);
-
-  const release = () => {
-    if (released) return Promise.resolve();
-    released = true;
-    return releaseKey(coord, {
-      key_id: keyId,
-      status: resp.status,
-      latency_ms: Date.now() - start,
-      ...(usage || { input_tokens: 0, output_tokens: 0, total_tokens: 0 }),
-      retry_after_ms: retryAfter,
-    }).catch(e => log("error", "Release failed in stream:", e?.message || e));
-  };
-
-  const transform = new TransformStream({
-    transform(chunk, controller) {
-      controller.enqueue(chunk);
-      const text = decoder.decode(chunk, { stream: true });
-      buffer += text;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          try {
-            const json = JSON.parse(line.slice(6));
-            if (json?.usage) {
-              usage = {
-                input_tokens: json.usage.prompt_tokens || json.usage.input_tokens || 0,
-                output_tokens: json.usage.completion_tokens || json.usage.output_tokens || 0,
-                total_tokens: json.usage.total_tokens || 0,
-              };
-            }
-          } catch {}
-        }
-      }
-    },
-    async flush() {
-      // اتمام طبیعی استریم upstream → آزادسازی رزرو با usage ثبت‌شده
-      await release();
-    },
-  });
-
-  // تک‌لوله‌ای: resp.body فقط یک‌بار خوانده می‌شود؛ readable سمت transform
-  // به کلاینت داده می‌شود. قطع اتصال کلاینت → cancel شدن readable →
-  // خطای pump → catch → آزادسازی رزرو. بدون این، inflight لو می‌رود.
-  const pump = resp.body.pipeTo(transform.writable).catch(() => release());
-  waitUntil(pump);
-
-  const headers = new Headers(resp.headers);
-  headers.set("x-request-id", reqId);
-  headers.set("cache-control", "no-store");
-
-  return new Response(transform.readable, {
-    status: resp.status,
-    statusText: resp.statusText,
-    headers,
-  });
 }
 
 async function releaseKey(coord, data) {
@@ -452,181 +630,176 @@ async function releaseKey(coord, data) {
   });
 }
 
-async function cancelKey(coord, keyId) {
+async function cancelKey(coord, keyIdValue) {
   return coord.fetch("https://coordinator/cancel", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ key_id: keyId }),
+    body: JSON.stringify({ key_id: keyIdValue }),
   });
 }
 
-function isRetryable(status) {
-  return [408, 425, 429, 500, 502, 503, 504].includes(status) ||
-         status === 401 || status === 403;
-}
+function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil) {
+  if (!response.body) return finalizeResponse(response, reqId);
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let usage = null;
+  let released = false;
+  const retryAfter = getRetryAfter(response);
 
-function finalizeResponse(resp, reqId) {
-  const headers = new Headers(resp.headers);
-  headers.set("x-request-id", reqId);
-  headers.set("cache-control", "no-store");
-  return new Response(resp.body, {
-    status: resp.status,
-    statusText: resp.statusText,
-    headers,
-  });
-}
+  const release = () => {
+    if (released) return Promise.resolve();
+    released = true;
+    const known = Boolean(usage);
+    return releaseKey(coord, {
+      key_id: keyIdValue,
+      status: response.status,
+      latency_ms: Date.now() - start,
+      ...(usage || { input_tokens: 0, output_tokens: 0, total_tokens: 0 }),
+      usage_known: known,
+      retry_after_ms: retryAfter,
+    }).catch(error => log("error", "stream release failed", error?.message || error));
+  };
 
-function err(msg, status, extra = {}) {
-  return Response.json({ error: msg }, {
-    status,
-    headers: {
-      "cache-control": "no-store",
-      ...extra,
+  const transform = new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(chunk);
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) usage = mergeUsage(usage, parseSseLine(line));
+    },
+    async flush() {
+      buffer += decoder.decode();
+      for (const line of buffer.split(/\r?\n/)) usage = mergeUsage(usage, parseSseLine(line));
+      await release();
     },
   });
+
+  const pump = response.body.pipeTo(transform.writable).catch(error => release().then(() => { throw error; }));
+  waitUntil(pump.catch(() => {}));
+  return new Response(transform.readable, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders(response, reqId),
+  });
 }
 
-// ---- Factory Function ----
-
 export function createFetchHandler(customConfig = {}) {
-  return async function(request, env, ctx) {
-    if (!env.UPSTREAM_BASE_URL || !env.UPSTREAM_API_KEYS) {
-      return err("provider_not_configured", 500);
+  return async function handler(request, env, ctx) {
+    if (!env.UPSTREAM_BASE_URL || !env.UPSTREAM_API_KEYS || !env.KEY_COORDINATOR) {
+      return errorResponse("provider_not_configured", 500);
     }
-
-    const config = {
-      timeout: Number(env.UPSTREAM_TIMEOUT_MS) || Number(customConfig.timeout) || 180000,
-      maxAttempts: Number(env.MAX_ATTEMPTS) || Number(customConfig.maxAttempts) || 4,
-      backoff: Number(env.BACKOFF_MS) || Number(customConfig.backoff) || 350,
-      maxBackoff: Number(env.MAX_BACKOFF_MS) || Number(customConfig.maxBackoff) || 60000,
-      maxBodyBytes: Number(env.MAX_BODY_BYTES) || Number(customConfig.maxBodyBytes) || 25 * 1024 * 1024,
-    };
+    const config = runtimeConfig(env, customConfig);
     const authMode = String(env.AUTH_MODE || customConfig.authMode || "bearer").toLowerCase();
-    const waitUntil = (p) => {
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
-      else if (p && typeof p.catch === "function") p.catch(() => {});
+    const waitUntil = promise => {
+      if (ctx?.waitUntil) ctx.waitUntil(Promise.resolve(promise).catch(() => {}));
+      else Promise.resolve(promise).catch(() => {});
     };
-
     const url = new URL(request.url);
+    const reqIdHeader = request.headers.get("x-request-id");
+    const reqId = validId(reqIdHeader) ? reqIdHeader : crypto.randomUUID();
     const base = String(env.UPSTREAM_BASE_URL).replace(/\/+$/, "");
-    const reqId = validId(request.headers.get("x-request-id"))
-      ? request.headers.get("x-request-id")
-      : crypto.randomUUID();
     const coord = env.KEY_COORDINATOR.getByName("global");
 
     const contentLength = Number(request.headers.get("content-length") || 0);
     if (Number.isFinite(contentLength) && contentLength > config.maxBodyBytes) {
-      return err("request_body_too_large", 413, { "x-request-id": reqId });
+      return errorResponse("request_body_too_large", 413, reqId);
     }
 
-    // ── بدنه یک‌بار و قبل از حلقه‌ی failover بافر می‌شود ──
-    const hasBody = request.method !== "GET" && request.method !== "HEAD" && request.body !== null;
-    const bodyBuffer = hasBody ? await request.arrayBuffer() : null;
-    if (bodyBuffer && bodyBuffer.byteLength > config.maxBodyBytes) {
-      return err("request_body_too_large", 413, { "x-request-id": reqId });
+    const hasBody = !["GET", "HEAD"].includes(request.method) && request.body !== null;
+    let bodyBuffer = null;
+    if (hasBody) {
+      try {
+        // Retries require a replayable body. We therefore buffer only up to the
+        // configured hard limit, reading incrementally so an oversized/chunked
+        // request can never force an unbounded allocation.
+        bodyBuffer = await readBoundedBody(request, config.maxBodyBytes);
+      } catch (error) {
+        if (error?.name === "BodyTooLargeError") return errorResponse("request_body_too_large", 413, reqId);
+        throw error;
+      }
     }
 
     const tried = new Set();
     let lastResponse = null;
     let lastError = null;
+    const started = Date.now();
 
     for (let attempt = 0; attempt < config.maxAttempts; attempt++) {
-      // در تلاش‌های بعدی: کلیدهای امتحان‌شده حذف می‌شوند؛ کلید degradedِ
-      // همین درخواست (5xx/خطای شبکه) مجاز به retry است.
-      const selectReq = new Request("https://coordinator/select", {
+      if (Date.now() - started > config.maxRetryTime && attempt > 0) break;
+      const select = await coord.fetch(new Request("https://coordinator/select", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           exclude: [...tried],
           allow_degraded: attempt > 0,
+          allow_half_open: true,
+          retry_key: attempt > 0 ? [...tried].at(-1) : null,
         }),
-      });
-      const selectResp = await coord.fetch(selectReq);
-      if (!selectResp.ok) {
-        log("error", "Select failed:", selectResp.status);
-        // اگر پاسخ واقعی upstream داریم، همان به کلاینت برسد
+      }));
+      if (!select.ok) {
         if (lastResponse) return finalizeResponse(lastResponse, reqId);
-        return err("no_healthy_api_key", 503, { "x-request-id": reqId });
+        const payload = await select.json().catch(() => ({}));
+        return errorResponse(payload.error || "no_healthy_api_key", select.status, reqId);
       }
-      const selectData = await selectResp.json();
-      if (!selectData.api_key) {
-        return err("no_additional_api_key_available", 503, { "x-request-id": reqId });
-      }
-      if (tried.has(selectData.key_id)) {
-        // انتخاب تکراری یعنی کلید دیگری موجود نیست. تفکیک دو حالت:
-        //  - اگر خطای قطعی کلید (401/403/429) داشتیم: رزرو بی‌استفاده آزاد و
-        //    پایان کار با همان پاسخ واقعی upstream (retry بی‌معناست).
-        //  - اگر خطای گذرا (5xx/شبکه) داشتیم: همین رزرو تازه برای تلاش
-        //    مجدد با همان کلید استفاده می‌شود (لغو نکن!).
-        const decisive = lastResponse && [401, 403, 429].includes(lastResponse.status);
-        if (decisive) {
-          await cancelKey(coord, selectData.key_id).catch(() => {});
-          log("warn", "No additional key available — returning last upstream response");
-          return finalizeResponse(lastResponse, reqId);
-        }
-        log("warn", "No additional key available — retrying with same key");
-      }
-      tried.add(selectData.key_id);
-
+      const selected = await select.json();
+      if (!selected.api_key || !selected.key_id) return errorResponse("no_additional_api_key_available", 503, reqId);
+      const keyIdValue = selected.key_id;
+      tried.add(keyIdValue);
       const start = Date.now();
+
       try {
-        const upstreamResp = await upstream(
-          request,
-          `${base}${url.pathname}${url.search}`,
-          selectData.api_key,
-          reqId,
-          attempt,
-          config.timeout,
-          bodyBuffer,
-          authMode
-        );
+        const response = await upstream(request, `${base}${url.pathname}${url.search}`, selected.api_key, reqId, attempt, config.timeout, bodyBuffer, authMode);
+        lastResponse = response;
 
-        const contentType = upstreamResp.headers.get("content-type") || "";
-        if (contentType.toLowerCase().includes("text/event-stream")) {
-          return streamResponse(upstreamResp, coord, selectData.key_id, start, reqId, waitUntil);
+        // Only successful SSE responses are streamable. Error SSE responses must
+        // enter the ordinary retry/failover pipeline.
+        if (isStreamResponse(response) && isSuccessfulStatus(response.status)) {
+          return streamResponse(response, coord, keyIdValue, start, reqId, waitUntil);
         }
 
-        const usage = await extractUsage(upstreamResp);
+        const usage = await extractUsage(response);
         await releaseKey(coord, {
-          key_id: selectData.key_id,
-          status: upstreamResp.status,
+          key_id: keyIdValue,
+          status: response.status,
           latency_ms: Date.now() - start,
-          ...usage,
-          retry_after_ms: getRetryAfter(upstreamResp),
-        });
+          ...(usage || { input_tokens: 0, output_tokens: 0, total_tokens: 0 }),
+          usage_known: Boolean(usage),
+          retry_after_ms: getRetryAfter(response),
+        }).catch(error => log("error", "release failed", error?.message || error));
 
-        lastResponse = upstreamResp;
+        if (!isRetryable(response.status) || attempt + 1 >= config.maxAttempts) return finalizeResponse(response, reqId);
 
-        if (upstreamResp.ok || (upstreamResp.status >= 300 && upstreamResp.status < 400)) {
-          return finalizeResponse(upstreamResp, reqId);
+        let delay = calculateRetryDelay(response, attempt, config, started);
+        if (AUTH_FAILURE_STATUSES.has(response.status) || response.status === 429) {
+          // Key-specific failures should fail over immediately. Retry-After is
+          // stored on the key and is enforced by the coordinator, not by
+          // sleeping the whole request before trying another key.
+          delay = 0;
+        } else if (isTransient(response.status)) {
+          delay = Math.max(delay, config.transientCooldown);
         }
-
-        if (isRetryable(upstreamResp.status) && attempt + 1 < config.maxAttempts) {
-          const waitMs = calculateWait(upstreamResp, attempt, config.backoff, config.maxBackoff);
-          log("info", `Retry attempt ${attempt+1} after ${waitMs}ms for status ${upstreamResp.status}`);
-          await sleep(waitMs);
-          continue;
-        }
-
-        return finalizeResponse(upstreamResp, reqId);
-      } catch (e) {
-        lastError = e;
-        log("error", `Request error (attempt ${attempt}):`, e?.message || e);
+        if (delay > 0) await sleep(Math.min(delay, Math.max(0, config.maxRetryTime - (Date.now() - started))));
+      } catch (error) {
+        lastError = error;
         await releaseKey(coord, {
-          key_id: selectData.key_id,
+          key_id: keyIdValue,
           status: 0,
           latency_ms: Date.now() - start,
-        }).catch(() => {});
-        if (attempt + 1 < config.maxAttempts) {
-          const waitMs = Math.min(config.maxBackoff, config.backoff * 2 ** attempt + Math.random() * 250);
-          await sleep(waitMs);
-          continue;
-        }
+          usage_known: false,
+          error_type: error?.name === "AbortError" ? "timeout" : "network",
+        }).catch(releaseError => log("error", "network release failed", releaseError?.message || releaseError));
+        if (attempt + 1 >= config.maxAttempts) break;
+        const remaining = config.maxRetryTime - (Date.now() - started);
+        if (remaining <= 0) break;
+        const retryDelay = Math.max(config.transientCooldown, fullJitterDelay(config.backoff, attempt, config.maxBackoff));
+        await sleep(Math.min(retryDelay, remaining));
       }
     }
 
     if (lastResponse) return finalizeResponse(lastResponse, reqId);
-    const errorMsg = lastError?.name === "AbortError" ? "upstream_timeout" : "upstream_unavailable";
-    return err(errorMsg, 502, { "x-request-id": reqId });
+    return errorResponse(lastError?.name === "AbortError" ? "upstream_timeout" : "upstream_unavailable", 502, reqId);
   };
 }
+
+export { keyId, parseKeys, getRetryAfter, normalizeUsage, runtimeConfig, isRetryable, readBoundedBody };

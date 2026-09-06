@@ -15,7 +15,7 @@ export default {
 
     // Health check
     if (url.pathname === "/health") {
-      return jsonResponse({ ok: true, service: "omniroute-master-proxy", version: "4.0.1" });
+      return jsonResponse({ ok: true, service: "omniroute-master-proxy", version: "5.0.4" });
     }
 
     // Route matching
@@ -40,10 +40,13 @@ export default {
       return jsonResponse({ error: "provider_binding_unavailable" }, 503);
     }
 
-    // محدودیت حجم بدنه
-    const maxBody = Number(env.MAX_BODY_BYTES || 26214400);
-    const contentLength = Number(request.headers.get("content-length") || 0);
-    if (Number.isFinite(contentLength) && contentLength > maxBody) {
+    // Apply an early Content-Length rejection without buffering the request.
+    // Chunked/streamed bodies are bounded by the provider, which is the
+    // authoritative replay boundary for retries and failover.
+    const maxBody = Number(env.MAX_BODY_BYTES || 10485760);
+    const contentLengthHeader = request.headers.get("content-length");
+    const contentLength = contentLengthHeader === null ? null : Number(contentLengthHeader);
+    if (contentLength !== null && Number.isFinite(contentLength) && contentLength > maxBody) {
       return jsonResponse({ error: "request_body_too_large" }, 413);
     }
 
@@ -64,10 +67,15 @@ export default {
 
     const targetPath = url.pathname.slice(route.prefix.length) || "/";
     const targetUrl = `https://internal${targetPath}${url.search}`;
+
+    // The provider is the authoritative body-limit/replay boundary. The router
+    // only performs an early Content-Length rejection here, then forwards the
+    // original stream untouched. This avoids buffering the body twice while
+    // preserving provider-side bounded buffering for retries/failover.
     const targetReq = new Request(targetUrl, {
       method: request.method,
-      headers: headers,
-      body: request.body,
+      headers,
+      body: request.body ?? undefined,
     });
 
     // ارسال به Provider
@@ -75,7 +83,7 @@ export default {
       const resp = await binding.fetch(targetReq);
       return decorateResponse(resp, reqId, route.provider);
     } catch (error) {
-      console.error(`Provider ${route.provider} error:`, error.message);
+      console.error(`Provider ${route.provider} error:`, error?.stack || error);
       return jsonResponse({
         error: "provider_unavailable",
         request_id: reqId,
@@ -92,11 +100,26 @@ function validId(v) {
 }
 
 function timingSafeEqual(a, b) {
-  // حلقه همیشه به طول رشته‌ی بلندتر اجرا می‌شود تا زمان‌بندی، طول کلید را لو ندهد
-  const len = Math.max(a.length, b.length);
-  let diff = a.length ^ b.length;
+  const encoder = new TextEncoder();
+  const aBytes = encoder.encode(a);
+  const bBytes = encoder.encode(b);
+  if (typeof crypto?.subtle?.timingSafeEqual === "function") {
+    if (aBytes.byteLength !== bBytes.byteLength) {
+      // timingSafeEqual requires equal-length inputs. Compare a buffer with
+      // itself before rejecting the different-length input.
+      crypto.subtle.timingSafeEqual(aBytes, aBytes);
+      return false;
+    }
+    return crypto.subtle.timingSafeEqual(aBytes, bBytes);
+  }
+
+  // Node's WebCrypto did not expose timingSafeEqual in every supported test
+  // runtime. Keep a constant-work fallback for local tests and non-Workers
+  // tooling; Cloudflare Workers uses the native implementation above.
+  const len = Math.max(aBytes.byteLength, bBytes.byteLength);
+  let diff = aBytes.byteLength ^ bBytes.byteLength;
   for (let i = 0; i < len; i++) {
-    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+    diff |= (aBytes[i] ?? 0) ^ (bBytes[i] ?? 0);
   }
   return diff === 0;
 }

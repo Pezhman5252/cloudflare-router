@@ -1,45 +1,42 @@
-# چک‌لیست انتشار v4
+# OmniRoute v5 — Release Checklist
 
-## قبل از استقرار
+## Automated checks
 
-- [ ] `npm install`
-- [ ] `node tests/v4-verify.mjs` → باید `45 موفق، 0 ناموفق` بدهد (کد واقعی + SQLite واقعی + شبیه‌سازی دقیق API واقعی DO SQL)
-- [ ] `npm run check` (dry-run باندل هر سه worker)
-- [ ] در `providers/bai/wrangler.toml` و `providers/dahl/wrangler.toml`: `AUTH_MODE` را با قرارداد واقعی provider چک کنید (`bearer` یا `x-api-key`)
-- [ ] در `router/wrangler.toml` مطمئن شوید `workers_dev=true` است (دسترسی عمومی راوتر) و کلید `ROUTER_API_KEY` قوی است
+Run:
 
-## Secrets (هرگز در Git)
+```bash
+npm ci
+npm run test:all
+npm run check
+```
 
-- [ ] `ROUTER_API_KEY` → راوتر
-- [ ] `UPSTREAM_API_KEYS` (لیست کاما-جدا) → هر دو provider
+`npm run test:all` must report:
 
-## ترتیب استقرار
+- syntax: PASS
+- static configuration: PASS
+- V5 verification: **25 passed, 0 failed** (or higher if more tests are added)
 
-- [ ] اول providerها: `npm run deploy:providers` (مهاجرت Durable Object `v1` با `new_sqlite_classes` خودش اعمال می‌شود)
-- [ ] بعد راوتر: `npm run deploy:router`
-- [ ] `https://<router>.workers.dev/health` → `200`
+`npm run check` must complete successfully for all three Wrangler configurations.
 
-## تست staging با کد واقعی
+## Required staging checks
 
-- [ ] JSON معمولی روی هر دو provider (`/a/...` و `/b/...`)
-- [ ] SSE استریمینگ (پاسخ باید روان برسد، نه 502 — قبلاً باگ بحرانی بود)
-- [ ] failover واقعی POST: یک کلید نامعتبر + یک کلید سالم → پاسخ 200 با کلید دوم
-- [ ] ۴+ درخواست هم‌زمان → کلیدها بینشان توزیع می‌شوند (نه همه یک کلید)
-- [ ] همه‌ی کلیدها 401 → پاس واقعی upstream (نه خطای مبهم)، و بازیابی کلید پس از ۱۵ دقیقه
-- [ ] 429 → کلید بعدی + احترام به Retry-After
-- [ ] 5xx/timeout → retry/failover محدود، پاس واقعی در انتها
-- [ ] 400/404 → passthrough فوری بدون جریمه‌ی کلید
-- [ ] قطع اتصال کلاینت حین استریم → رزرو آزاد می‌شود (stats نشان می‌دهد inflight=0)
-- [ ] `AUTH_MODE=x-api-key` در صورت نیاز provider
+1. Deploy provider Workers to a staging account/environment.
+2. Verify each provider has the correct `UPSTREAM_API_KEYS` secret.
+3. Send successful JSON and SSE requests.
+4. Inject 401, 403, 429, 408, 425, 500, 502, 503, 504 and network/timeout failures.
+5. Verify failover, Retry-After quarantine and recovery.
+6. Verify POST/PUT/PATCH bodies survive failover.
+7. Verify daily/monthly quota rollover.
+8. Verify Durable Object state survives Worker eviction/restart.
+9. Verify no API secret is returned in client responses or logs.
+10. Run a controlled concurrency/load test before public release.
 
-## امنیت
+## Production gate
 
-- [ ] هیچ secret ای در Git نیست
-- [ ] providerها `workers_dev=false` و `preview_urls=false`
-- [ ] WAF/rate limiting کلودفلر جلوی راوتر فعال شود
-- [ ] قرارداد دقیق احراز هویت و مدل‌های BAI/Dahl با مستندات فعلی‌شان تطبیق داده شود
+Do **not** publish as a public stable router until:
 
-## پایش
-
-- [ ] لاگ‌ها را چند روز اول ببینید (`No healthy API key available` = نشانه‌ی اتمام ظرفیت)
-- [ ] Wrangler روی نسخه‌ی آزموده pin شود
+- `npm ci` succeeds in a clean environment.
+- `npm run test:all` is green.
+- `npm run check` is green.
+- Staging tests against the real Cloudflare Workers runtime are green.
+- Upstream provider behavior has been verified for the exact models/endpoints you expose.

@@ -1,6 +1,6 @@
-# راهنمای کامل نصب — Cloudflare Router v4
+# راهنمای کامل نصب — Cloudflare Router v5
 
-این راهنما مخصوص پروژه‌ی **v4** (همین پوشه) است و مرحله‌به‌مرحله تا نصب کامل و تست واقعی پیش می‌رود. همه‌ی دستورها را **از داخل همین پوشه** اجرا کنید:
+این راهنما مخصوص پروژه‌ی **v5** (همین پوشه) است و مرحله‌به‌مرحله تا نصب کامل و تست واقعی پیش می‌رود. همه‌ی دستورها را **از داخل همین پوشه** اجرا کنید:
 
 ```powershell
 cd "C:\Users\Pezhman\Downloads\Pezhman - Copy\cloudflare-router\cloudflare-router"
@@ -62,10 +62,10 @@ npm install
 ## مرحله ۲ — اثبات سلامت کد (قبل از هر deploy)
 
 ```powershell
-node tests/v4-verify.mjs
+node tests/v5-verify.mjs
 ```
 
-✅ **خروجی موردانتظار:** عبارت `═══ نتیجه v4 فیکس‌شده: 45 موفق، 0 ناموفق ═══`
+✅ **خروجی موردانتظار:** عبارت `═══ نتیجه v5 فیکس‌شده: 31 موفق، 0 ناموفق ═══`
 
 این تست کد واقعی را با Durable Object و SQLite واقعی اجرا می‌کند. اگر این مرحله سبز نبود، جلوتر نروید.
 
@@ -157,7 +157,7 @@ https://omniroute-master-proxy.<subdomain>.workers.dev
 ```powershell
 Invoke-RestMethod "https://omniroute-master-proxy.<subdomain>.workers.dev/health"
 ```
-✅ **موردانتظار:** `ok : True` و `version : 4.0.1`
+✅ **موردانتظار:** `ok : True` و `version : 5.0.4`
 
 **۶-۲) درخواست واقعی غیراستریم** (به BAI از طریق مسیر `/a/...`):
 
@@ -247,7 +247,7 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
 
 ## چک‌لیست نهایی نصب
 
-- [ ] `node tests/v4-verify.mjs` → 45 موفق، 0 ناموفق
+- [ ] `node tests/v5-verify.mjs` → 31 موفق، 0 ناموفق
 - [ ] `npx wrangler whoami` → حساب درست
 - [ ] سه secret گذاشته شد (BAI / Dahl / ROUTER_API_KEY)
 - [ ] `AUTH_MODE` و `UPSTREAM_BASE_URL` هر دو provider با مستندات واقعی‌شان مطابقت دارد
