@@ -24,6 +24,8 @@ MONTHLY_TOKEN_LIMIT="0"
 RATE_COOLDOWN_MS="30000"
 AUTH_COOLDOWN_MS="900000"
 TRANSIENT_COOLDOWN_MS="5000"
+# در سکوت upstream (فکر کردن مدل) بعد از این مدت کامنت keep-alive در SSE فرستاده می‌شود؛ 0 = غیرفعال
+SSE_HEARTBEAT_MS="15000"
 
 [[durable_objects.bindings]]
 name="KEY_COORDINATOR"
