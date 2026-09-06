@@ -233,6 +233,38 @@ try {
     check("half-open probe recovers circuit", second.status === 200 && stateColumn(await statFor(t.coordinator, "KEY_A")) === "healthy");
   }
 
+  // 5b) A provider configured with exactly ONE key must behave honestly in every
+  // failure class: auth errors surface the real upstream response, rate limits
+  // surface the real 429 and self-heal after cooldown, quota exhaustion returns
+  // a clean 503. No masked errors, no hammering a cooled-down key.
+  {
+    const t = makeEnv(["KEY_A"]);
+    await t.runScript([new Response("no auth", { status: 401 })]);
+    const auth = await handler(new Request("https://internal/x"), t.env, t.ctx);
+    await t.settle();
+    check("single-key 401 surfaces the upstream response and quarantines the key", auth.status === 401 && stateColumn(await statFor(t.coordinator, "KEY_A")) === "invalid");
+
+    const t2 = makeEnv(["KEY_A"], { RATE_COOLDOWN_MS: "5" });
+    await t2.runScript([new Response("rate", { status: 429 })]);
+    const rate = await handler(new Request("https://internal/x"), t2.env, t2.ctx);
+    await t2.settle();
+    check("single-key 429 surfaces the upstream response", rate.status === 429 && t2.calls.length === 1);
+    await new Promise(r => setTimeout(r, 30));
+    await t2.runScript([new Response("ok", { status: 200 })]);
+    const healed = await handler(new Request("https://internal/x"), t2.env, t2.ctx);
+    await t2.settle();
+    check("single-key 429 self-heals after cooldown via half-open probe", healed.status === 200 && stateColumn(await statFor(t2.coordinator, "KEY_A")) === "healthy");
+
+    const t3 = makeEnv(["KEY_A"], { DAILY_TOKEN_LIMIT: "5" });
+    await t3.runScript([new Response(JSON.stringify({ usage: { total_tokens: 5 } }), { status: 200, headers: { "content-type": "application/json" } })]);
+    const first = await handler(new Request("https://internal/x"), t3.env, t3.ctx);
+    await t3.settle();
+    const second = await handler(new Request("https://internal/x"), t3.env, t3.ctx);
+    await t3.settle();
+    const body = await second.json();
+    check("single-key daily quota exhaustion returns a clean 503", first.status === 200 && second.status === 503 && body.error === "no_healthy_api_key");
+  }
+
   // 6) SSE success streams unchanged and records usage even when split across chunks.
   {
     const t = makeEnv(["KEY_A"]);

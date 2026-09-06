@@ -191,7 +191,7 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/nova/wrangler.toml
 
 ```powershell
 node --check providers/nova/src/index.js   # خطای سینتکس نداشته باشد
-npm run test:all                            # syntax + static + 53 تست
+npm run test:all                            # syntax + static + 57 تست
 npm run check                               # باندل خشک هر ۴ ورکر (خارج از سندباکس)
 npm run deploy:providers                    # ترتیب مهم است: اول همه‌ی providerها…
 npm run deploy:router                       # …بعد راوتر (binding به نام providerها وصل است)
