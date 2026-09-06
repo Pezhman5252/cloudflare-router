@@ -262,7 +262,26 @@ try {
     const second = await handler(new Request("https://internal/x"), t3.env, t3.ctx);
     await t3.settle();
     const body = await second.json();
-    check("single-key daily quota exhaustion returns a clean 503", first.status === 200 && second.status === 503 && body.error === "no_healthy_api_key");
+    check("single-key daily quota exhaustion returns a clean 503 with reason", first.status === 200 && second.status === 503 && body.error === "no_healthy_api_key" && body.reason === "all_keys_in_cooldown_or_quota");
+  }
+
+  // 5c) The 503 no_healthy_api_key response must be self-explanatory: it names
+  // the reason (cooldown vs. missing secret) and reports when the provider heals.
+  {
+    const t = makeEnv(["KEY_A"], { RATE_COOLDOWN_MS: "60000", MAX_COOLDOWN_MS: "60000" });
+    await t.runScript([new Response("rate", { status: 429 })]);
+    const first = await handler(new Request("https://internal/x"), t.env, t.ctx);
+    await t.settle();
+    check("single-key 429 surfaces the upstream response", first.status === 429);
+    const second = await handler(new Request("https://internal/x"), t.env, t.ctx);
+    const cooldownBody = await second.json();
+    const retryAfterMs = Number(cooldownBody.retry_after_ms);
+    check("cooldown 503 reports reason and remaining retry window", second.status === 503 && cooldownBody.reason === "all_keys_in_cooldown_or_quota" && retryAfterMs > 50000 && retryAfterMs <= 60000);
+
+    const empty = makeEnv(["   "]);
+    const missing = await handler(new Request("https://internal/x"), empty.env, empty.ctx);
+    const missingBody = await missing.json();
+    check("blank UPSTREAM_API_KEYS reports no_api_keys_configured", missing.status === 503 && missingBody.reason === "no_api_keys_configured");
   }
 
   // 6) SSE success streams unchanged and records usage even when split across chunks.

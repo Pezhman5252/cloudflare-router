@@ -464,7 +464,23 @@ export class ApiKeyCoordinator extends DurableObject {
          config.dailyTokenLimit > 0 ? 1 : 0, config.dailyTokenLimit,
          config.monthlyTokenLimit > 0 ? 1 : 0, config.monthlyTokenLimit).raw()];
     }
-    if (!rows.length) return Response.json({ error: "no_healthy_api_key" }, { status: 503 });
+    if (!rows.length) {
+      // Distinguish the failure modes so operators are not left guessing:
+      // an empty pool means the secret is missing/empty, otherwise keys exist
+      // but are all cooling down (429/401/5xx) or quota-blocked. Report the
+      // soonest cooldown so clients know when the provider will heal.
+      let retryAfterMs = null;
+      if (allowedIds.length) {
+        const nearest = [...this.sql.exec(`SELECT MIN(cooldown) FROM keys WHERE id IN (${allowedPlaceholders})`, ...allowedIds).raw()][0]?.[0];
+        const nearestMs = Number(nearest);
+        if (Number.isFinite(nearestMs) && nearestMs > now) retryAfterMs = Math.min(nearestMs - now, config.maxCooldown);
+      }
+      return Response.json({
+        error: "no_healthy_api_key",
+        reason: keys.length === 0 ? "no_api_keys_configured" : "all_keys_in_cooldown_or_quota",
+        ...(retryAfterMs !== null ? { retry_after_ms: retryAfterMs } : {}),
+      }, { status: 503 });
+    }
 
     // Selected row columns: 0=id 1=state 2=cooldown 10=half_open_probe.
     const row = rows[0];
@@ -585,6 +601,7 @@ export class ApiKeyCoordinator extends DurableObject {
       circuitOpenCount,
       kid
     );
+    log("info", "Key released", kid.slice(0, 12), `status=${status || errorType || "ok"}`, `state=${state}`, `cooldown_ms=${Math.max(0, cooldown - now)}`);
     return Response.json({ ok: true });
   }
 
@@ -796,7 +813,21 @@ export function createFetchHandler(customConfig = {}) {
       if (!select.ok) {
         if (lastResponse) return finalizeResponse(lastResponse, reqId);
         const payload = await select.json().catch(() => ({}));
-        return errorResponse(payload.error || "no_healthy_api_key", select.status, reqId);
+        log("warn", "key selection failed", payload.reason || payload.error || select.status);
+        const retryAfterMs = Number(payload.retry_after_ms);
+        return Response.json({
+          error: payload.error || "no_healthy_api_key",
+          ...(payload.reason ? { reason: payload.reason } : {}),
+          ...(retryAfterMs > 0 ? { retry_after_ms: retryAfterMs } : {}),
+          ...(reqId ? { request_id: reqId } : {}),
+        }, {
+          status: select.status,
+          headers: {
+            "cache-control": "no-store",
+            ...(reqId ? { "x-request-id": reqId } : {}),
+            ...(retryAfterMs > 0 ? { "retry-after": String(Math.max(1, Math.ceil(retryAfterMs / 1000))) } : {}),
+          },
+        });
       }
       const selected = await select.json();
       if (!selected.api_key || !selected.key_id) return errorResponse("no_additional_api_key_available", 503, reqId);

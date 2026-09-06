@@ -136,19 +136,20 @@ npm run deploy
 جزئیات gate انتشار در `RELEASE_CHECKLIST.md` است.
 
 
-## API key configuration (V5.0.5)
+## API key configuration (V5.0.6)
 
 `UPSTREAM_API_KEYS` accepts the legacy comma-separated format, semicolon/newline-separated values, or a JSON array. Use the JSON-array form when a provider key itself can contain commas, for example `[`"`key,with,commas`"`]`. The provider worker enforces the configured body limit incrementally and buffers only up to that limit because request replay is required for failover retries.
 
 
-### Request body handling (V5.0.5)
+### Request body handling (V5.0.6)
 
 The router performs an early `Content-Length` rejection but does not buffer request bodies. Chunked/streamed bodies are forwarded directly through the Service Binding. The provider is the authoritative bounded replay boundary: it incrementally reads and buffers only up to `MAX_BODY_BYTES`, returning HTTP 413 when the limit is exceeded. This avoids buffering the same request body twice while preserving retry/failover replay.
 
-### V5.0.5 hardening notes
+### V5.0.6 hardening notes
 
 - Stuck-reservation lease GC: a worker that dies between key selection and release can no longer pin a key (or an orphaned half-open probe) forever; reservations older than `max(UPSTREAM_TIMEOUT_MS + MAX_RETRY_TIME_MS + 60s, MAX_COOLDOWN_MS)` are reclaimed on the next selection.
 - Hop-by-hop headers are stripped at both the router and the provider; conditional-request (`if-none-match`, …), `Range` and `Expect` are stripped upstream so a cached 304 or clipped body can never corrupt usage accounting or retries. Upstream `Set-Cookie` never reaches clients.
 - `parseKeys` also accepts human-written bracket forms (`['a','b']`, `[key1, key2]`) instead of silently mangling them into wrong key IDs.
 - The router and provider parse `MAX_BODY_BYTES` identically (non-positive/non-numeric falls back to the default).
 - SSE passthrough bounds its line-remainder buffer so a hostile upstream cannot grow worker memory without limit.
+- `503 no_healthy_api_key` responses are self-explanatory: they carry a `reason` (`no_api_keys_configured` vs `all_keys_in_cooldown_or_quota`), `retry_after_ms` and a standard `Retry-After` header, and every key release logs `Key released … status=… state=… cooldown_ms=…` so cooldown/quarantine causes are visible in `wrangler tail`.

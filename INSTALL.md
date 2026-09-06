@@ -65,7 +65,7 @@ npm install
 node tests/v5-verify.mjs
 ```
 
-✅ **خروجی موردانتظار:** عبارت `RESULT: 57 passed, 0 failed`
+✅ **خروجی موردانتظار:** عبارت `RESULT: 60 passed, 0 failed`
 
 این تست کد واقعی را با Durable Object و SQLite واقعی اجرا می‌کند. اگر این مرحله سبز نبود، جلوتر نروید.
 
@@ -157,7 +157,7 @@ https://polyroute-master-proxy.<subdomain>.workers.dev
 ```powershell
 Invoke-RestMethod "https://polyroute-master-proxy.<subdomain>.workers.dev/health"
 ```
-✅ **موردانتظار:** `ok : True` و `version : 5.0.5`
+✅ **موردانتظار:** `ok : True` و `version : 5.0.6`
 
 **۶-۲) درخواست واقعی غیراستریم** (به BAI از طریق مسیر `/a/...`):
 
@@ -236,7 +236,8 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
 | `/health` → 404 | URL اشتباه یا راوتر deploy نشده | URL دقیق را از خروجی `deploy:router` بردارید |
 | هر درخواست → `401 unauthorized` | کلید گیت‌وی اشتباه یا هدر غلط | مقدار دقیق `ROUTER_API_KEY` را با هدر `Authorization: Bearer ...` بفرستید |
 | پاسخ `401` از خود provider | کلید upstream نامعتبر | محتوای `UPSTREAM_API_KEYS` را چک کنید (بدون فاصله/خط اضافه)؛ اگر درست بود، بعد از ۱۵ دقیقه (قرنطینه) دوباره امتحان کنید یا کلید را عوض کنید |
-| `503 no_healthy_api_key` | همه‌ی کلیدها در قرنطینه | کلیدهای سالم بگذارید؛ یا صبر کنید cooldown تمام شود |
+| `503 no_healthy_api_key` با `reason: no_api_keys_configured` | مقدار secret `UPSTREAM_API_KEYS` برای همین provider ست نشده یا خالی/نامعتبر است | `npx wrangler secret put UPSTREAM_API_KEYS -c providers/<x>/wrangler.toml` — دقیقاً کلید provider، بدون کوتیشن |
+| `503 no_healthy_api_key` با `retry_after_ms` (+ هدر `Retry-After`) | همه‌ی کلیدها بعد از 429/401/403/5xx وارد cooldown شده‌اند؛ با فقط یک کلید، کل provider تا پایان cooldown در دسترس نیست | تا پایان cooldown صبر کنید (خودکار heal می‌شود)؛ علت دقیق در `wrangler tail` با خط `Key released … status=… state=… cooldown_ms=…` دیده می‌شود؛ راه‌حل دائمی: ۲–۳ کلید برای آن provider |
 | `502 upstream_unavailable` / `upstream_timeout` | upstream از دسترس خارج یا کند | `UPSTREAM_BASE_URL` را مستقیم با curl تست کنید؛ تایم‌اوت را با `UPSTREAM_TIMEOUT_MS` در toml تنظیم کنید |
 | پاسخ JSON از provider → `401/403` با وجود کلید درست | `AUTH_MODE` نادرست | در toml به `x-api-key` (یا برعکس) تغییر دهید و redeploy |
 | استریم تدریجی نیست (همه یکجا) | کلاینت/پروکسی واسط بافر می‌کند | با `curl.exe -N` مستقیم تست کنید؛ اگر مستقیم روان بود، مشکل از کلاینت شماست نه راوتر |
@@ -248,7 +249,7 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/bai/wrangler.toml
 
 ## چک‌لیست نهایی نصب
 
-- [ ] `node tests/v5-verify.mjs` → 57 passed, 0 failed
+- [ ] `node tests/v5-verify.mjs` → 60 passed, 0 failed
 - [ ] `npx wrangler whoami` → حساب درست
 - [ ] سه secret گذاشته شد (BAI / Dahl / ROUTER_API_KEY)
 - [ ] `AUTH_MODE` و `UPSTREAM_BASE_URL` هر دو provider با مستندات واقعی‌شان مطابقت دارد
