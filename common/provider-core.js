@@ -9,6 +9,7 @@ const DEFAULTS = {
   maxBodyBytes: 10 * 1024 * 1024,
   authCooldown: 900000,
   forbiddenCooldown: 900000,
+  sseHeartbeatMs: 15000,
   rateCooldown: 30000,
   transientCooldown: 5000,
   maxCooldown: 15 * 60 * 1000,
@@ -108,6 +109,7 @@ function runtimeConfig(env, custom = {}) {
     maxBodyBytes: cfgNumber(env, "MAX_BODY_BYTES", custom.maxBodyBytes ?? DEFAULTS.maxBodyBytes, 1),
     authCooldown: cfgNumber(env, "AUTH_COOLDOWN_MS", custom.authCooldown ?? DEFAULTS.authCooldown),
     forbiddenCooldown: cfgNumber(env, "FORBIDDEN_COOLDOWN_MS", custom.forbiddenCooldown ?? DEFAULTS.forbiddenCooldown),
+    sseHeartbeatMs: cfgNumber(env, "SSE_HEARTBEAT_MS", custom.sseHeartbeatMs ?? DEFAULTS.sseHeartbeatMs),
     rateCooldown: cfgNumber(env, "RATE_COOLDOWN_MS", custom.rateCooldown ?? DEFAULTS.rateCooldown),
     transientCooldown: cfgNumber(env, "TRANSIENT_COOLDOWN_MS", custom.transientCooldown ?? DEFAULTS.transientCooldown),
     maxCooldown: cfgNumber(env, "MAX_COOLDOWN_MS", custom.maxCooldown ?? DEFAULTS.maxCooldown),
@@ -707,12 +709,28 @@ async function releaseKey(coord, data) {
   });
 }
 
-function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil) {
+function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil, keepAliveMs = 0) {
   if (!response.body) return finalizeResponse(response, reqId);
   const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const keepAliveBytes = encoder.encode(": keep-alive\n\n");
+  const TRUNCATED_TRAIL_BYTES = encoder.encode(
+    `data: {"error":{"message":"upstream stream ended before finish_reason (connection closed mid-stream)","type":"upstream_stream_truncated","code":"upstream_stream_truncated"}}\n\ndata: [DONE]\n\n`
+  );
+  const FINISH_RE = /"finish_reason"\s*:\s*"(?!null)/;
   let buffer = "";
   let usage = null;
   let released = false;
+  let sawTerminator = false;
+  let upstreamBroken = false;
+  let lastActivity = Date.now();
+  let heartbeatTimer = null;
+  const stopHeartbeat = () => {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  };
   const retryAfter = getRetryAfter(response);
 
   const release = () => {
@@ -730,25 +748,99 @@ function streamResponse(response, coord, keyIdValue, start, reqId, waitUntil) {
   };
 
   const transform = new TransformStream({
+    start(controller) {
+      // Long "thinking" gaps (reasoning models, upstream buffering) produce a
+      // silent stream; intermediaries close idle connections, which the client
+      // experiences as "Stream ended without finish_reason". SSE comments are
+      // ignored by every parser, so a periodic keep-alive comment keeps every
+      // hop alive without touching the payload.
+      if (!(keepAliveMs > 0)) return;
+      heartbeatTimer = setInterval(() => {
+        if (Date.now() - lastActivity < keepAliveMs) return;
+        try { controller.enqueue(keepAliveBytes); } catch {}
+        lastActivity = Date.now();
+      }, Math.max(250, Math.floor(keepAliveMs / 2)));
+    },
     transform(chunk, controller) {
+      lastActivity = Date.now();
       controller.enqueue(chunk);
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || "";
-      for (const line of lines) usage = mergeUsage(usage, parseSseLine(line));
+      for (const line of lines) {
+        if (line === "data: [DONE]" || FINISH_RE.test(line)) sawTerminator = true;
+        usage = mergeUsage(usage, parseSseLine(line));
+      }
       // A hostile or broken upstream that never terminates a line could make
       // this buffer grow without bound; parse everything complete, then drop
       // the pathological remainder. The stream passthrough is unaffected.
       if (buffer.length > 1000000) buffer = "";
     },
-    async flush() {
+    async cancel() {
+      // The client went away (closed the tab, aborted the turn). The pump
+      // continues in the background until the upstream connection is torn
+      // down; usage is still released so the key stays balanced.
+      stopHeartbeat();
+      sawTerminator = true;
+      await release();
+    },
+    async flush(controller) {
+      stopHeartbeat();
       buffer += decoder.decode();
-      for (const line of buffer.split(/\r?\n/)) usage = mergeUsage(usage, parseSseLine(line));
+      const lines = buffer.split(/\r?\n/);
+      buffer = "";
+      for (const line of lines) {
+        if (line === "data: [DONE]" || FINISH_RE.test(line)) sawTerminator = true;
+        usage = mergeUsage(usage, parseSseLine(line));
+      }
+      if (!sawTerminator) {
+        // The upstream ended the stream without [DONE] and without a
+        // finish_reason — or its body errored mid-stream. Either way, a raw
+        // truncated stream is exactly what clients report as "Stream ended
+        // without finish_reason". Terminate with a well-formed SSE trailer
+        // carrying a structured, self-describing error, then [DONE], so the
+        // client always sees a complete, parseable stream and can surface our
+        // explicit truncation marker instead of a generic transport failure.
+        const durationMs = Date.now() - start;
+        if (upstreamBroken) {
+          log("error", "Upstream stream broke without finish signal", `duration_ms=${durationMs}`, `usage_known=${Boolean(usage)}`);
+        } else {
+          log("warn", "SSE stream ended without finish signal", `duration_ms=${durationMs}`, `usage_known=${Boolean(usage)}`);
+        }
+        try { controller.enqueue(TRUNCATED_TRAIL_BYTES); } catch {}
+      }
       await release();
     },
   });
 
-  const pump = response.body.pipeTo(transform.writable).catch(error => release().then(() => { throw error; }));
+  // Pipe through a guarded source: an upstream body error mid-stream must not
+  // propagate as an aborted destination (which would leave the client with an
+  // unparseable, half-delivered stream). A broken upstream is converted into a
+  // clean end so flush() can append the truncation trailer.
+  const upstreamReader = response.body.getReader();
+  const guardedSource = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await upstreamReader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        upstreamBroken = true;
+        try { controller.close(); } catch {}
+        log("error", "Upstream stream read failed", error?.message || error);
+      }
+    },
+    cancel(reason) {
+      return upstreamReader.cancel(reason).catch(() => {});
+    },
+  });
+
+  const pump = guardedSource.pipeTo(transform.writable)
+    .catch(error => release().then(() => { throw error; }))
+    .finally(() => stopHeartbeat());
   waitUntil(pump.catch(() => {}));
   return new Response(transform.readable, {
     status: response.status,
@@ -842,7 +934,7 @@ export function createFetchHandler(customConfig = {}) {
         // Only successful SSE responses are streamable. Error SSE responses must
         // enter the ordinary retry/failover pipeline.
         if (isStreamResponse(response) && isSuccessfulStatus(response.status)) {
-          return streamResponse(response, coord, keyIdValue, start, reqId, waitUntil);
+          return streamResponse(response, coord, keyIdValue, start, reqId, waitUntil, config.sseHeartbeatMs);
         }
 
         const usage = await extractUsage(response);

@@ -300,6 +300,7 @@ try {
     const text = await response.text();
     await t.settle();
     check("successful SSE remains a stream response", response.status === 200 && text.includes('"total_tokens":10'));
+    check("fast streams carry no heartbeat noise", !text.includes(": keep-alive"));
     const row = await statFor(t.coordinator, "KEY_A");
     check("SSE usage is counted as known usage", dayTokensColumn(row) === 10 && unknownUsageColumn(row) === 0);
   }
@@ -344,6 +345,101 @@ try {
     check("usage after a dropped remainder is still counted", dayTokensColumn(row) === 5 && unknownUsageColumn(row) === 0);
   }
 
+  // 7c) SSE heartbeat: during upstream silence (model "thinking"), the proxy
+  // must emit keep-alive comment lines so idle hops never close the stream,
+  // and the usage parser must ignore them.
+  {
+    const t = makeEnv(["KEY_A"], { SSE_HEARTBEAT_MS: "40" });
+    let upstreamController = null;
+    const stream = new ReadableStream({
+      start(controller) { upstreamController = controller; },
+    });
+    await t.runScript([new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })]);
+    const response = await handler(new Request("https://internal/stream"), t.env, t.ctx);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    await new Promise(r => setTimeout(r, 300));
+    const before = decoder.decode((await reader.read()).value);
+    check("heartbeat is emitted during upstream silence before first token", before.includes(": keep-alive"));
+    upstreamController.enqueue(new TextEncoder().encode('data: {"usage":{"total_tokens":3}}\n\n'));
+    const during = decoder.decode((await reader.read()).value);
+    check("data chunks pass through untouched", during.includes('"total_tokens":3'));
+    await new Promise(r => setTimeout(r, 300));
+    upstreamController.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+    upstreamController.close();
+    let rest = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      rest += decoder.decode(value);
+    }
+    await t.settle();
+    check("heartbeat repeats per idle window and [DONE] still terminates", rest.includes(": keep-alive") && rest.includes("[DONE]"));
+    const row = await statFor(t.coordinator, "KEY_A");
+    check("usage is counted correctly with heartbeats present", dayTokensColumn(row) === 3 && unknownUsageColumn(row) === 0);
+  }
+
+  // 7d) A mid-stream upstream failure must NOT reach the client as a broken
+  // stream: the guarded pump converts the upstream error into a clean close
+  // and flush appends a structured truncation error + [DONE].
+  {
+    const t = makeEnv(["KEY_A"]);
+    let upstreamController = null;
+    const stream = new ReadableStream({
+      start(controller) { upstreamController = controller; },
+    });
+    await t.runScript([new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })]);
+    const response = await handler(new Request("https://internal/stream"), t.env, t.ctx);
+    const readPromise = response.text();
+    upstreamController.enqueue(new TextEncoder().encode('data: {"usage":{"total_tokens":9}}\n\n'));
+    await new Promise(r => setTimeout(r, 100));
+    upstreamController.error(new Error("upstream connection reset"));
+    let text = null;
+    let threw = null;
+    try { text = await readPromise; } catch (error) { threw = error; }
+    await t.settle();
+    check("upstream mid-stream failure becomes a clean SSE ending", threw === null && text !== null && text.includes('"code":"upstream_stream_truncated"') && text.includes("data: [DONE]"));
+    const row = await statFor(t.coordinator, "KEY_A");
+    check("mid-stream failure still counts usage and releases the key", inflightColumn(row) === 0 && dayTokensColumn(row) === 9 && unknownUsageColumn(row) === 0);
+  }
+
+  // 7e) A well-formed but terminator-less upstream close (no [DONE], no
+  // finish_reason) gets the same structured trailer instead of a silent end.
+  {
+    const t = makeEnv(["KEY_A"]);
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc.encode('data: {"usage":{"total_tokens":6}}\n\n'));
+        controller.close();
+      },
+    });
+    await t.runScript([new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })]);
+    const response = await handler(new Request("https://internal/stream"), t.env, t.ctx);
+    const text = await response.text();
+    await t.settle();
+    check("terminator-less upstream close ends with structured truncation error and [DONE]", text.includes('"code":"upstream_stream_truncated"') && text.includes("data: [DONE]"));
+    const row = await statFor(t.coordinator, "KEY_A");
+    check("terminator-less stream releases with known usage", inflightColumn(row) === 0 && dayTokensColumn(row) === 6);
+  }
+
+  // 7f) A healthy stream (proper [DONE]) carries NO truncation trailer.
+  {
+    const t = makeEnv(["KEY_A"]);
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc.encode('data: {"usage":{"total_tokens":2}}\n\ndata: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+    await t.runScript([new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } })]);
+    const response = await handler(new Request("https://internal/stream"), t.env, t.ctx);
+    const text = await response.text();
+    await t.settle();
+    check("healthy stream is passed through with no truncation trailer", !text.includes("upstream_stream_truncated") && text.includes("data: [DONE]"));
+  }
+
   // 8) SSE error must NOT bypass failover.
   {
     const t = makeEnv(["KEY_A", "KEY_B"]);
@@ -355,7 +451,9 @@ try {
     const response = await handler(new Request("https://internal/stream"), t.env, t.ctx);
     const text = await response.text();
     await t.settle();
-    check("SSE error enters failover pipeline", response.status === 200 && text === "ok" && t.calls.length === 2);
+    // The passthrough body is untouched; because the fake upstream body has no
+    // [DONE]/finish_reason, the proxy appends its structured truncation trailer.
+    check("SSE error enters failover pipeline", response.status === 200 && text.startsWith("ok") && t.calls.length === 2 && text.includes('"code":"upstream_stream_truncated"'));
   }
 
   // 9) Unknown usage is not counted as zero known usage.

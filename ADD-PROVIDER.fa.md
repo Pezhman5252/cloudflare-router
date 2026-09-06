@@ -55,6 +55,8 @@ MONTHLY_TOKEN_LIMIT="0"
 RATE_COOLDOWN_MS="30000"
 AUTH_COOLDOWN_MS="900000"
 TRANSIENT_COOLDOWN_MS="5000"
+# در سکوت upstream (فکر کردن مدل) بعد از این مدت کامنت keep-alive در SSE فرستاده می‌شود؛ 0 = غیرفعال
+SSE_HEARTBEAT_MS="15000"
 
 [[durable_objects.bindings]]
 name="KEY_COORDINATOR"
@@ -106,6 +108,7 @@ export default {
 | `RATE_COOLDOWN_MS` | سردشدن کلید بعد از `429` | اگر upstream هدر `Retry-After` بدهد همان استفاده می‌شود |
 | `AUTH_COOLDOWN_MS` | قرنطینه کلید بعد از `401` | — |
 | `TRANSIENT_COOLDOWN_MS` | حداقل مکث قبل از تلاش مجدد روی خطاهای گذرا (۵xx/timeout/شبکه) | — |
+| `SSE_HEARTBEAT_MS` | در سکوت upstream بعد از این مدت، کامنت `: keep-alive` در استریم SSE فرستاده می‌شود تا اتصال‌های idle وسط «فکر کردن» مدل بسته نشوند | پیش‌فرض ۱۵۰۰۰؛ `0` = غیرفعال |
 | `tag="v1"` | تگ مهاجرت DO | **برای هر Worker مستقل است** — Worker جدید از `v1` شروع می‌کند؛ عدد بقیه‌ی پروایدرها ربطی به آن ندارد |
 
 ---
@@ -191,7 +194,7 @@ npx wrangler secret put UPSTREAM_API_KEYS -c providers/nova/wrangler.toml
 
 ```powershell
 node --check providers/nova/src/index.js   # خطای سینتکس نداشته باشد
-npm run test:all                            # syntax + static + 60 تست
+npm run test:all                            # syntax + static + 70 تست
 npm run check                               # باندل خشک هر ۴ ورکر (خارج از سندباکس)
 npm run deploy:providers                    # ترتیب مهم است: اول همه‌ی providerها…
 npm run deploy:router                       # …بعد راوتر (binding به نام providerها وصل است)
